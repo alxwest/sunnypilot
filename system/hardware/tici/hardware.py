@@ -543,7 +543,7 @@ class Tici(HardwareBase):
 
     lte_info = self.get_network_info()
     if lte_info is not None:
-      extra = lte_info['extra']
+      extra = lte_info.get('extra', '')
 
       # <state>,"LTE",<is_tdd>,<mcc>,<mnc>,<cellid>,<pcid>,<earfcn>,<freq_band_ind>,
       # <ul_bandwidth>,<dl_bandwidth>,<tac>,<rsrp>,<rsrq>,<rssi>,<sinr>,<srxlev>
