@@ -72,6 +72,12 @@ class MeteredType(IntEnum):
   NO = 2
 
 
+class NetworkMode(IntEnum):
+  NONE = 0
+  WIFI = 1
+  CELLULAR = 2
+
+
 def get_security_type(flags: int, wpa_flags: int, rsn_flags: int) -> SecurityType:
   wpa_props = wpa_flags | rsn_flags
 
@@ -288,6 +294,24 @@ class WifiManager:
     return self._current_network_metered
 
   @property
+  def network_mode(self) -> NetworkMode:
+    if self._router_main is None:
+      return NetworkMode.NONE
+
+    try:
+      wireless_enabled = self._router_main.send_and_get_reply(Properties(self._nm).get('WirelessEnabled')).body[0][1]
+      wwan_enabled = self._router_main.send_and_get_reply(Properties(self._nm).get('WwanEnabled')).body[0][1]
+    except Exception as e:
+      cloudlog.exception(f"Error getting network mode: {e}")
+      return NetworkMode.NONE
+
+    if wireless_enabled:
+      return NetworkMode.WIFI
+    if wwan_enabled:
+      return NetworkMode.CELLULAR
+    return NetworkMode.NONE
+
+  @property
   def connecting_to_ssid(self) -> str | None:
     wifi_state = self._wifi_state
     return wifi_state.ssid if wifi_state.status == ConnectStatus.CONNECTING else None
@@ -323,6 +347,38 @@ class WifiManager:
     if active:
       self._init_wifi_state(block=False)
       self._update_networks(block=False)
+
+  def set_network_mode(self, mode: NetworkMode):
+    def worker():
+      try:
+        if mode == NetworkMode.WIFI:
+          self._set_network_radio('WwanEnabled', False)
+          self._set_network_radio('WirelessEnabled', True)
+          self._update_networks(block=True)
+        elif mode == NetworkMode.CELLULAR:
+          self._set_network_radio('WirelessEnabled', False)
+          self._set_connecting(None)
+          self._set_network_radio('WwanEnabled', True)
+
+          lte_connection_path = self._get_lte_connection_path()
+          if lte_connection_path:
+            self._activate_modem_connection(lte_connection_path)
+          else:
+            cloudlog.warning("No LTE connection found")
+        else:
+          self._set_network_radio('WirelessEnabled', False)
+          self._set_network_radio('WwanEnabled', False)
+          self._set_connecting(None)
+      except Exception as e:
+        cloudlog.exception(f"Error setting network mode: {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+  def _set_network_radio(self, prop: str, enabled: bool):
+    nm_props = DBusAddress(NM_PATH, bus_name=NM, interface=NM_PROPERTIES_IFACE)
+    reply = self._router_main.send_and_get_reply(new_method_call(nm_props, 'Set', 'ssv', (NM_IFACE, prop, ('b', enabled))))
+    if reply.header.message_type == MessageType.error:
+      cloudlog.warning(f"Failed to set {prop} to {enabled}: {reply}")
 
   def _monitor_state(self):
     # Filter for signals
