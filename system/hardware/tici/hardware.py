@@ -27,6 +27,7 @@ DBUS_PROPS = 'org.freedesktop.DBus.Properties'
 MM = 'org.freedesktop.ModemManager1'
 MM_MODEM = MM + ".Modem"
 MM_MODEM_SIMPLE = MM + ".Modem.Simple"
+MM_MODEM_3GPP = MM + ".Modem.Modem3gpp"
 MM_SIM = MM + ".Sim"
 
 class MM_MODEM_STATE(IntEnum):
@@ -209,30 +210,46 @@ class Tici(HardwareBase):
 
     return str(self.get_modem().Get(MM_MODEM, 'EquipmentIdentifier', dbus_interface=DBUS_PROPS, timeout=TIMEOUT))
 
+  def get_modem_operator(self, modem):
+    try:
+      return str(modem.Get(MM_MODEM_3GPP, 'OperatorName', dbus_interface=DBUS_PROPS, timeout=TIMEOUT))
+    except Exception:
+      return ""
+
   def get_network_info(self):
-    if self.get_device_type() == "mici":
-      return None
     try:
       modem = self.get_modem()
-      info = modem.Command("AT+QNWINFO", math.ceil(TIMEOUT), dbus_interface=MM_MODEM, timeout=TIMEOUT)
-      extra = modem.Command('AT+QENG="servingcell"', math.ceil(TIMEOUT), dbus_interface=MM_MODEM, timeout=TIMEOUT)
       state = modem.Get(MM_MODEM, 'State', dbus_interface=DBUS_PROPS, timeout=TIMEOUT)
     except Exception:
       return None
 
+    operator_name = self.get_modem_operator(modem)
+    try:
+      state = "" if state is None else MM_MODEM_STATE(state).name
+    except ValueError:
+      state = str(state)
+
+    if self.get_device_type() == "mici":
+      return {'operator': operator_name, 'state': state} if operator_name else None
+
+    try:
+      info = modem.Command("AT+QNWINFO", math.ceil(TIMEOUT), dbus_interface=MM_MODEM, timeout=TIMEOUT)
+      extra = modem.Command('AT+QENG="servingcell"', math.ceil(TIMEOUT), dbus_interface=MM_MODEM, timeout=TIMEOUT)
+    except Exception:
+      return {'operator': operator_name, 'state': state} if operator_name else None
+
     if info and info.startswith('+QNWINFO: '):
       info = info.replace('+QNWINFO: ', '').replace('"', '').split(',')
       extra = "" if extra is None else extra.replace('+QENG: "servingcell",', '').replace('"', '')
-      state = "" if state is None else MM_MODEM_STATE(state).name
 
       if len(info) != 4:
-        return None
+        return {'operator': operator_name, 'state': state} if operator_name else None
 
       technology, operator, band, channel = info
 
       return({
         'technology': technology,
-        'operator': operator,
+        'operator': operator_name or operator,
         'band': band,
         'channel': int(channel),
         'extra': extra,
