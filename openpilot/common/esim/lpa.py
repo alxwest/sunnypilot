@@ -93,6 +93,12 @@ BPP_ERROR_MESSAGES = {
   10: "Not enough memory on the eUICC to install this profile.",
   12: "The eUICC could not process the carrier profile elements. The profile package may be incompatible with this eUICC.",
 }
+PE_STATUS_NAMES = {
+  0: "ok", 1: "pe-not-supported", 2: "memory-failure", 3: "bad-values",
+  4: "not-enough-memory", 5: "invalid-request-format", 6: "invalid-parameter",
+  7: "runtime-not-supported", 8: "lib-not-supported", 9: "template-not-supported",
+  10: "feature-not-supported", 11: "pin-code-missing", 31: "unsupported-profile-version",
+}
 
 # SGP.22 §5.2.6 SM-DP+ reason/subject codes mapped to user-friendly messages
 ES9P_ERROR_MESSAGES: dict[tuple[str, str], str] = {
@@ -562,6 +568,45 @@ def _split_bpp(bpp: bytes) -> list[bytes]:
   return chunks
 
 
+def _parse_sima_response(response: bytes) -> dict[str, Any]:
+  """Decode the diagnostic EUICCResponse objects returned by the profile interpreter."""
+  statuses: list[dict[str, Any]] = []
+  installation_aborted = False
+  for tag, value in iter_tlv(response):
+    if tag != 0x30:  # EUICCResponse
+      continue
+    for response_tag, response_value in iter_tlv(value):
+      if response_tag == 0xA0:  # peStatus
+        for status_tag, status_value in iter_tlv(response_value):
+          if status_tag != 0x30:  # PEStatus
+            continue
+          status = find_tag(status_value, TAG_STATUS)
+          if status is None:
+            continue
+          status_code = int.from_bytes(status, "big")
+          pe_status: dict[str, Any] = {
+            "status": status_code,
+            "statusName": PE_STATUS_NAMES.get(status_code, f"unknown({status_code})"),
+          }
+          identification = find_tag(status_value, 0x81)
+          if identification is not None:
+            pe_status["identification"] = int.from_bytes(identification, "big")
+          additional_info = find_tag(status_value, 0x82)
+          if additional_info is not None:
+            pe_status["additionalInformation"] = additional_info.hex().upper()
+          offset = find_tag(status_value, 0x83)
+          if offset is not None:
+            pe_status["offset"] = int.from_bytes(offset, "big")
+          statuses.append(pe_status)
+      elif response_tag == 0x81:  # profileInstallationAborted
+        installation_aborted = True
+  return {
+    "peStatuses": statuses,
+    "profileInstallationAborted": installation_aborted,
+    "simaResponse": response.hex().upper(),
+  }
+
+
 def _parse_install_result(response: bytes) -> dict[str, Any] | None:
   """Parse a ProfileInstallResult from an APDU response, or None if not present."""
   root = find_tag(response, TAG_PROFILE_INSTALL_RESULT)
@@ -570,7 +615,15 @@ def _parse_install_result(response: bytes) -> dict[str, Any] | None:
   result_data = find_tag(root, TAG_INSTALL_RESULT_DATA)
   if not result_data:
     return None
-  result: dict[str, Any] = {"seqNumber": 0, "success": False, "bppCommandId": None, "errorReason": None}
+  result: dict[str, Any] = {
+    "seqNumber": 0,
+    "success": False,
+    "bppCommandId": None,
+    "errorReason": None,
+    "peStatuses": [],
+    "profileInstallationAborted": False,
+    "simaResponse": None,
+  }
   notif_meta = find_tag(result_data, TAG_NOTIFICATION_METADATA)
   if notif_meta:
     seq_num = find_tag(notif_meta, TAG_STATUS)
@@ -588,6 +641,9 @@ def _parse_install_result(response: bytes) -> dict[str, Any] | None:
         err = find_tag(value, 0x81)
         if err:
           result["errorReason"] = int.from_bytes(err, "big")
+        sima_response = find_tag(value, 0x04)
+        if sima_response is not None:
+          result.update(_parse_sima_response(sima_response))
   return result
 
 
@@ -610,6 +666,20 @@ def load_bpp(client: AtClient, b64_bpp: str) -> dict:
       msg = f"Profile installation failed at {cmd_name}: {err_name}"
     else:
       msg = f"{msg} ({cmd_name}: {err_name})"
+    if result["peStatuses"]:
+      diagnostics = []
+      for status in result["peStatuses"]:
+        diagnostic = f"{status['statusName']} ({status['status']})"
+        if "identification" in status:
+          diagnostic += f", profile element {status['identification']}"
+        if "offset" in status:
+          diagnostic += f", offset {status['offset']}"
+        if "additionalInformation" in status:
+          diagnostic += f", additional information {status['additionalInformation']}"
+        diagnostics.append(diagnostic)
+      msg += f"; eUICC diagnostic: {'; '.join(diagnostics)}"
+    if result["profileInstallationAborted"]:
+      msg += "; installation aborted"
     raise RuntimeError(msg)
   if not result["success"]:
     raise RuntimeError("Profile installation failed: no result from eUICC")
