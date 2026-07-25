@@ -14,9 +14,11 @@ from pathlib import Path
 from typing import BinaryIO
 
 import openpilot.cereal.messaging as messaging
+from openpilot.common.hardware import HARDWARE
 from openpilot.common.hardware.hw import Paths
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
+from openpilot.common.version import get_version
 from openpilot.system.loggerd.config import PARKING_BUFFER_DIR
 from openpilot.system.loggerd.parking_settings import PARKING_ROUTE_COUNT_PARAM, get_int, put_int
 
@@ -29,6 +31,77 @@ TS_PACKET_SIZE = 188
 TS_PAT_PID = 0x0000
 TS_PMT_PID = 0x0100
 TS_VIDEO_PID = 0x0101
+
+
+def _param_text(params: Params, key: str) -> str:
+  value = params.get(key)
+  if isinstance(value, bytes):
+    return value.decode(errors="replace")
+  return value or ""
+
+
+def _decode_pts(data: bytes) -> int:
+  return (((data[0] >> 1) & 0x07) << 30) | (data[1] << 22) | \
+         ((data[2] >> 1) << 15) | (data[3] << 7) | (data[4] >> 1)
+
+
+def _ts_duration_seconds(path: Path) -> float:
+  first_pts: int | None = None
+  last_pts: int | None = None
+  with path.open("rb") as stream:
+    while packet := stream.read(TS_PACKET_SIZE):
+      if len(packet) != TS_PACKET_SIZE or packet[0] != 0x47:
+        continue
+      pid = ((packet[1] & 0x1f) << 8) | packet[2]
+      if pid != TS_VIDEO_PID or not packet[1] & 0x40:
+        continue
+      adaptation_control = (packet[3] >> 4) & 0x03
+      if adaptation_control not in (1, 3):
+        continue
+      offset = 4
+      if adaptation_control == 3:
+        offset += 1 + packet[offset]
+      payload = packet[offset:]
+      if len(payload) < 14 or payload[:4] != b"\x00\x00\x01\xe0" or not payload[7] & 0x80:
+        continue
+      pts = _decode_pts(payload[9:14])
+      first_pts = pts if first_pts is None else first_pts
+      last_pts = pts
+  if first_pts is None or last_pts is None:
+    return 0.0
+  return max(0.0, (last_pts - first_pts) / 90000.0 + 1.0 / 20.0)
+
+
+def _write_route_qlog(path: Path, params: Params, start_wall_time_ns: int, duration: float) -> None:
+  # Connect discovers routes by parsing qlogs. These three messages match the
+  # metadata envelope loggerd writes for a single-segment route.
+  start_mono_time_ns = time.monotonic_ns()
+  init_msg = messaging.new_message("initData", valid=True)
+  init_msg.logMonoTime = start_mono_time_ns
+  init = init_msg.initData
+  init.wallTimeNanos = start_wall_time_ns
+  init.version = get_version()
+  init.deviceType = HARDWARE.get_device_type()
+  init.gitCommit = _param_text(params, "GitCommit")
+  init.gitCommitDate = _param_text(params, "GitCommitDate")
+  init.gitBranch = _param_text(params, "GitBranch")
+  init.gitRemote = _param_text(params, "GitRemote")
+  init.dongleId = _param_text(params, "DongleId")
+  init.passive = False
+
+  start_msg = messaging.new_message("sentinel", valid=True)
+  start_msg.logMonoTime = start_mono_time_ns
+  start_msg.sentinel.type = "startOfRoute"
+
+  end_msg = messaging.new_message("sentinel", valid=True)
+  end_msg.logMonoTime = start_mono_time_ns + int(duration * 1e9)
+  end_msg.sentinel.type = "endOfRoute"
+
+  tmp = path.with_suffix(".tmp")
+  with tmp.open("wb") as output:
+    for msg in (init_msg, start_msg, end_msg):
+      output.write(msg.to_bytes())
+  os.replace(tmp, path)
 
 
 def _mpeg_crc32(data: bytes) -> int:
@@ -195,6 +268,25 @@ class ParkingRecorder:
 
     shutil.rmtree(self.buffer_dir, ignore_errors=True)
     self.events_dir.mkdir(parents=True)
+    self._backfill_route_qlogs()
+
+  def _backfill_route_qlogs(self) -> None:
+    for output_dir in self.root.glob("800000*--0"):
+      output = output_dir / "qcamera.ts"
+      qlog = output_dir / "qlog"
+      if not output.is_file() or qlog.exists() or (output_dir / "qlog.zst").exists():
+        continue
+      lock = output_dir / "qlog.lock"
+      try:
+        lock.touch()
+        duration = _ts_duration_seconds(output)
+        start_wall_time_ns = output.stat().st_mtime_ns - int(duration * 1e9)
+        _write_route_qlog(qlog, self.params, start_wall_time_ns, duration)
+        cloudlog.event("parking_qlog_backfilled", path=str(qlog))
+      except Exception:
+        cloudlog.exception("failed to backfill parking qlog")
+      finally:
+        lock.unlink(missing_ok=True)
 
   def _new_route_name(self) -> str:
     count = get_int(self.params, PARKING_ROUTE_COUNT_PARAM)
@@ -310,6 +402,10 @@ class ParkingRecorder:
               first_frame = False
         if writer.frame_count == 0:
           raise ValueError("Parking event contained no video frames")
+
+      duration = writer.frame_count / 20.0
+      start_wall_time_ns = output.stat().st_mtime_ns - int(duration * 1e9)
+      _write_route_qlog(output_dir / "qlog", self.params, start_wall_time_ns, duration)
 
       routes = [r for r in (self.params.get("AthenadRecentlyViewedRoutes") or "").split(",") if r]
       if route not in routes:
