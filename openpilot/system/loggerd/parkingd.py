@@ -92,6 +92,21 @@ def _is_keyframe(frame: bytes) -> bool:
   return b"\x00\x00\x00\x01\x65" in frame or b"\x00\x00\x01\x65" in frame
 
 
+def _has_sps(frame: bytes) -> bool:
+  return b"\x00\x00\x00\x01\x67" in frame or b"\x00\x00\x01\x67" in frame
+
+
+def _h264_codec_header(frames: list[tuple[int, bytes]]) -> bytes:
+  for _, frame in frames:
+    idr_offsets = [i for marker in (b"\x00\x00\x00\x01\x65", b"\x00\x00\x01\x65")
+                   if (i := frame.find(marker)) > 0]
+    if idr_offsets:
+      header = frame[:min(idr_offsets)]
+      if _has_sps(header) and (b"\x00\x00\x00\x01\x68" in header or b"\x00\x00\x01\x68" in header):
+        return header
+  return b""
+
+
 def _split_video_segments(frames: list[tuple[int, bytes]]) -> list[list[tuple[int, bytes]]]:
   segments: list[list[tuple[int, bytes]]] = [[]]
   for frame in frames:
@@ -347,7 +362,7 @@ class ParkingRecorder:
       if not source.is_file():
         continue
       try:
-        if os.getxattr(source, "user.parking_migrated").startswith(b"v4:"):
+        if os.getxattr(source, "user.parking_migrated").startswith(b"v5:"):
           continue
       except OSError:
         pass
@@ -358,7 +373,7 @@ class ParkingRecorder:
         duration = len(frames) / 20.0
         start_wall_time_ns = source.stat().st_mtime_ns - int(duration * 1e9)
         self._write_segmented_route(route, frames, start_wall_time_ns)
-        os.setxattr(source, "user.parking_migrated", b"v4:" + route.encode())
+        os.setxattr(source, "user.parking_migrated", b"v5:" + route.encode())
         self._mark_route_for_upload(route)
         cloudlog.event("parking_route_migrated", source=str(legacy_dir), route=route)
       except Exception:
@@ -367,11 +382,14 @@ class ParkingRecorder:
   def _write_segmented_route(self, route: str, frames: list[tuple[int, bytes]],
                              start_wall_time_ns: int) -> list[Path]:
     segments = _split_video_segments(frames)
+    codec_header = _h264_codec_header(frames)
     output_dirs: list[Path] = []
     locks: list[Path] = []
     global_frame_offset = 0
     try:
       for segment_num, segment_frames in enumerate(segments):
+        if codec_header and not _has_sps(segment_frames[0][1]):
+          segment_frames[0] = (segment_frames[0][0], codec_header + segment_frames[0][1])
         output_dir = self.root / f"{route}--{segment_num}"
         output_dir.mkdir()
         output_dirs.append(output_dir)
