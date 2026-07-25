@@ -91,7 +91,7 @@ BPP_ERROR_REASONS = {
 BPP_ERROR_MESSAGES = {
   9: "This eSIM profile is already installed on this device.",
   10: "Not enough memory on the eUICC to install this profile.",
-  12: "Profile installation failed. The QR code may have already been used.",
+  12: "The eUICC could not process the carrier profile elements. The profile package may be incompatible with this eUICC.",
 }
 
 # SGP.22 §5.2.6 SM-DP+ reason/subject codes mapped to user-friendly messages
@@ -584,11 +584,13 @@ def load_bpp(client: AtClient, b64_bpp: str) -> dict:
   if result is None:
     raise RuntimeError("Profile installation failed: no result from eUICC")
   if not result["success"] and result["errorReason"] is not None:
+    cmd_name = BPP_COMMAND_NAMES.get(result["bppCommandId"], f"unknown({result['bppCommandId']})")
+    err_name = BPP_ERROR_REASONS.get(result["errorReason"], f"unknown({result['errorReason']})")
     msg = BPP_ERROR_MESSAGES.get(result["errorReason"])
     if not msg:
-      cmd_name = BPP_COMMAND_NAMES.get(result["bppCommandId"], f"unknown({result['bppCommandId']})")
-      err_name = BPP_ERROR_REASONS.get(result["errorReason"], f"unknown({result['errorReason']})")
       msg = f"Profile installation failed at {cmd_name}: {err_name}"
+    else:
+      msg = f"{msg} ({cmd_name}: {err_name})"
     raise RuntimeError(msg)
   if not result["success"]:
     raise RuntimeError("Profile installation failed: no result from eUICC")
