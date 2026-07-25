@@ -65,6 +65,7 @@ INITIAL_STATE: dict[str, object] = {
 
 
 class State(Enum):
+  DISABLED = "DISABLED"
   INITIALIZING = "INITIALIZING"
   SEARCHING = "SEARCHING"
   CONNECTING = "CONNECTING"
@@ -391,8 +392,12 @@ class Modem:
       return True
     return False
 
+  def _cellular_enabled(self) -> bool:
+    mode = self._read_param("NetworkMode")
+    return mode in ("", "2")
+
   def _check_iccid(self, state):
-    if state in (State.INITIALIZING, State.DISCONNECTING) or not self.S["iccid"]:
+    if state in (State.DISABLED, State.INITIALIZING, State.DISCONNECTING) or not self.S["iccid"]:
       return
     iccid = (self._atv("AT+QCCID", "+QCCID:") or "").rstrip("F")
     if iccid and iccid != self.S["iccid"]:
@@ -416,7 +421,10 @@ class Modem:
     self._ppp.cleanup_routes()
     self._ppp.reset_data_port()
     self._sim_change = False
-    return State.INITIALIZING
+    return State.INITIALIZING if self._cellular_enabled() else State.DISABLED
+
+  def _do_disabled(self):
+    return State.INITIALIZING if self._cellular_enabled() else State.DISABLED
 
   def _poll_signal(self) -> dict:
     v = self._atv("AT+CSQ", "+CSQ:")
@@ -543,6 +551,7 @@ class Modem:
     state = State.INITIALIZING
 
     handlers = {
+      State.DISABLED: self._do_disabled,
       State.INITIALIZING: self._do_initializing,
       State.SEARCHING: self._do_searching,
       State.CONNECTING: self._do_connecting,
@@ -552,6 +561,8 @@ class Modem:
 
     while self.running:
       try:
+        if not self._cellular_enabled() and state not in (State.DISABLED, State.DISCONNECTING):
+          state = State.DISCONNECTING
         self._check_iccid(state)
         prev = state
         state = handlers[state]()

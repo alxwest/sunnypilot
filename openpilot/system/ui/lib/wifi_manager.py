@@ -72,6 +72,12 @@ class MeteredType(IntEnum):
   NO = 2
 
 
+class NetworkMode(IntEnum):
+  NONE = 0
+  WIFI = 1
+  CELLULAR = 2
+
+
 def get_security_type(flags: int, wpa_flags: int, rsn_flags: int) -> SecurityType:
   wpa_props = wpa_flags | rsn_flags
 
@@ -289,6 +295,16 @@ class WifiManager:
     return self._current_network_metered
 
   @property
+  def network_mode(self) -> NetworkMode:
+    if Params is None:
+      return NetworkMode.NONE
+
+    try:
+      return NetworkMode(Params().get("NetworkMode", return_default=True))
+    except (TypeError, ValueError):
+      return NetworkMode.CELLULAR
+
+  @property
   def connecting_to_ssid(self) -> str | None:
     wifi_state = self._wifi_state
     return wifi_state.ssid if wifi_state.status == ConnectStatus.CONNECTING else None
@@ -324,6 +340,32 @@ class WifiManager:
     if active:
       self._init_wifi_state(block=False)
       self._update_networks(block=False)
+
+  def set_network_mode(self, mode: NetworkMode):
+    def worker():
+      try:
+        if Params is not None:
+          Params().put("NetworkMode", int(mode), block=True)
+
+        wifi_enabled = mode == NetworkMode.WIFI
+        self._set_network_radio('WirelessEnabled', wifi_enabled)
+        if wifi_enabled:
+          self._update_networks(block=True)
+        else:
+          self._set_connecting(None)
+      except Exception as e:
+        cloudlog.exception(f"Error setting network mode: {e}")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+  def _set_network_radio(self, prop: str, enabled: bool):
+    if self._router_main is None:
+      return
+
+    nm_props = DBusAddress(NM_PATH, bus_name=NM, interface=NM_PROPERTIES_IFACE)
+    reply = self._router_main.send_and_get_reply(new_method_call(nm_props, 'Set', 'ssv', (NM_IFACE, prop, ('b', enabled))))
+    if reply.header.message_type == MessageType.error:
+      cloudlog.warning(f"Failed to set {prop} to {enabled}: {reply}")
 
   def _monitor_state(self):
     # Filter for signals

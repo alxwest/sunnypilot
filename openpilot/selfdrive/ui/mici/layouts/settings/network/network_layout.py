@@ -1,3 +1,5 @@
+import time
+
 from openpilot.system.ui.widgets.scroller import NavScroller
 from openpilot.selfdrive.ui.mici.layouts.settings.network import WifiNetworkButton
 from openpilot.selfdrive.ui.mici.layouts.settings.network.wifi_ui import WifiUIMici
@@ -6,7 +8,15 @@ from openpilot.selfdrive.ui.mici.widgets.dialog import BigInputDialog
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.ui.lib.prime_state import PrimeType
 from openpilot.system.ui.lib.application import gui_app
-from openpilot.system.ui.lib.wifi_manager import WifiManager, Network, MeteredType
+from openpilot.system.ui.lib.wifi_manager import WifiManager, Network, MeteredType, NetworkMode
+
+NETWORK_MODE_OPTIONS = ["wi-fi", "cellular", "offline"]
+NETWORK_MODE_TO_OPTION = {
+  NetworkMode.WIFI: "wi-fi",
+  NetworkMode.CELLULAR: "cellular",
+  NetworkMode.NONE: "offline",
+}
+OPTION_TO_NETWORK_MODE = {value: key for key, value in NETWORK_MODE_TO_OPTION.items()}
 
 
 class NetworkLayoutMici(NavScroller):
@@ -20,6 +30,13 @@ class NetworkLayoutMici(NavScroller):
     self._wifi_manager.add_callbacks(
       networks_updated=self._on_network_updated,
     )
+
+    # ******** Network Mode ********
+    def network_mode_callback(value: str):
+      self._wifi_manager.set_network_mode(OPTION_TO_NETWORK_MODE[value])
+
+    self._network_mode_btn = BigMultiToggle("network mode", NETWORK_MODE_OPTIONS, select_callback=network_mode_callback)
+    self._last_network_mode_update = 0.0
 
     # ******** Tethering ********
     def tethering_toggle_callback(checked: bool):
@@ -77,6 +94,7 @@ class NetworkLayoutMici(NavScroller):
 
     # Main scroller ----------------------------------
     self._scroller.add_widgets([
+      self._network_mode_btn,
       self._wifi_button,
       self._network_metered_btn,
       self._tethering_toggle_btn,
@@ -94,6 +112,9 @@ class NetworkLayoutMici(NavScroller):
     # If not using prime SIM, show GSM settings and enable IPv4 forwarding
     show_cell_settings = ui_state.prime_state.get_type() in (PrimeType.NONE, PrimeType.LITE)
     self._wifi_manager.set_ipv4_forward(show_cell_settings)
+    if time.monotonic() - self._last_network_mode_update > 1.0:
+      self._network_mode_btn.set_value(NETWORK_MODE_TO_OPTION.get(self._wifi_manager.network_mode, "cellular"))
+      self._last_network_mode_update = time.monotonic()
     self._roaming_btn.set_visible(show_cell_settings)
     self._apn_btn.set_visible(show_cell_settings)
     self._cellular_metered_btn.set_visible(show_cell_settings)
