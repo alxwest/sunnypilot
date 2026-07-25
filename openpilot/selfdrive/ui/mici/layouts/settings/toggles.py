@@ -1,12 +1,26 @@
 from openpilot.cereal import log
 
 from openpilot.system.ui.widgets.scroller import NavScroller
-from openpilot.selfdrive.ui.mici.widgets.button import BigParamControl, BigMultiParamToggle
+from openpilot.selfdrive.ui.mici.widgets.button import BigParamControl, BigMultiParamToggle, BigToggle
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.selfdrive.ui.layouts.settings.common import restart_needed_callback
 from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.system.loggerd.parking_settings import PARKING_ENABLED_PARAM, get_bool as get_parking_setting, put_bool as put_parking_setting
 
 PERSONALITY_TO_INT = log.LongitudinalPersonality.schema.enumerants
+
+
+class ParkingMotionControl(BigToggle):
+  def __init__(self):
+    super().__init__("parking motion recording", "")
+    self.set_checked(get_parking_setting(ui_state.params, PARKING_ENABLED_PARAM))
+
+  def _handle_mouse_release(self, mouse_pos):
+    super()._handle_mouse_release(mouse_pos)
+    put_parking_setting(ui_state.params, PARKING_ENABLED_PARAM, self._checked)
+
+  def refresh(self):
+    self.set_checked(get_parking_setting(ui_state.params, PARKING_ENABLED_PARAM))
 
 
 class TogglesLayoutMici(NavScroller):
@@ -21,9 +35,11 @@ class TogglesLayoutMici(NavScroller):
     record_front = BigParamControl("record & upload driver camera", "RecordFront", toggle_callback=restart_needed_callback)
     record_mic = BigParamControl("record & upload mic audio", "RecordAudio", toggle_callback=restart_needed_callback)
     enable_openpilot = BigParamControl("enable sunnypilot", "OpenpilotEnabledToggle", toggle_callback=restart_needed_callback)
+    self._parking_motion_recording = ParkingMotionControl()
     radar_tracks = BigParamControl("radar tracks", "RadarTracks")
 
     self._scroller.add_widgets([
+      self._parking_motion_recording,
       radar_tracks,
       self._personality_toggle,
       self._experimental_btn,
@@ -88,3 +104,4 @@ class TogglesLayoutMici(NavScroller):
     # Refresh toggles from params to mirror external changes
     for key, item in self._refresh_toggles:
       item.set_checked(ui_state.params.get_bool(key))
+    self._parking_motion_recording.refresh()
