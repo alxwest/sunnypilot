@@ -641,7 +641,11 @@ def _parse_install_result(response: bytes) -> dict[str, Any] | None:
         err = find_tag(value, 0x81)
         if err:
           result["errorReason"] = int.from_bytes(err, "big")
-        sima_response = find_tag(value, 0x04)
+        # SGP.22's ASN.1 encodes simaResponse as the third ErrorResult field
+        # (context-specific tag 0x82); accept the universal OCTET STRING tag too.
+        sima_response = find_tag(value, 0x82)
+        if sima_response is None:
+          sima_response = find_tag(value, 0x04)
         if sima_response is not None:
           result.update(_parse_sima_response(sima_response))
   return result
