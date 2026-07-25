@@ -83,20 +83,21 @@ class TestMonitoring:
                     (TEST_TIMESPAN - 10 - s._VISION_POLICY_ALERT_3_TIMEOUT) / 2) / DT_DMON)] == 3
     assert isinstance(d_status.awareness, float)
 
-  # engaged, distracted past red and beyond the no-response window -> unavailability response + lockout
-  def test_distracted_lockout(self):
+  # engaged, distracted past red and beyond the no-response window -> no timed re-engagement lockout
+  def test_distracted_no_lockout(self):
     alert_lvls, d_status = self._run_seq(always_distracted, always_false, always_true, always_false)
     assert alert_lvls[int(DISTRACTED_SECONDS_TO_RED / DT_DMON)] == 3
-    assert d_status.lockout_active
-    assert d_status.lockout_time_elapsed > 0
-    assert d_status.lockout_count >= 1
+    assert not d_status.lockout_active
+    assert d_status.lockout_time_elapsed == 0
+    assert d_status.lockout_count == 0
 
-  # no face -> wheeltouch red, sustained past the no-response timeout -> unavailability response + lockout
-  def test_invisible_lockout(self):
+  # no face -> wheeltouch red, sustained past the no-response timeout -> no timed re-engagement lockout
+  def test_invisible_no_lockout(self):
     _, d_status = self._run_seq(always_no_face, always_false, always_true, always_false)
     assert d_status.active_policy == log.DriverMonitoringState.MonitoringPolicy.wheeltouch
-    assert d_status.lockout_active
-    assert d_status.lockout_count >= 1
+    assert not d_status.lockout_active
+    assert d_status.lockout_time_elapsed == 0
+    assert d_status.lockout_count == 0
 
   # engaged, no face detected the whole time, no action
   def test_fully_invisible_driver(self):
