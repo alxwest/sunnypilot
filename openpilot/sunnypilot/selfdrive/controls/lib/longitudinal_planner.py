@@ -52,7 +52,8 @@ class LongitudinalPlannerSP:
     long_override = sm['carControl'].cruiseControl.override
 
     # Smart Cruise Control
-    self.scc.update(sm, long_enabled, long_override, v_ego, a_ego, v_cruise)
+    left_hand_traffic_fallback = bool(sm['driverMonitoringState'].isRHD) if sm.valid['driverMonitoringState'] else False
+    self.scc.update(sm, long_enabled, long_override, v_ego, a_ego, v_cruise, left_hand_traffic_fallback)
 
     # Speed Limit Resolver
     self.resolver.update(v_ego, sm)
