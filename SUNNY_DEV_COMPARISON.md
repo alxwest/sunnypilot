@@ -39,8 +39,8 @@ deployment commits:
 8. Cellular network status on the Mici home screen.
 9. A Wi-Fi/cellular/offline network-mode selector.
 10. Radar-track control in the current sunnylink settings schema.
-11. Removal of the packaged `prebuilt` marker so changed native/source
-    components are rebuilt on first launch.
+11. A rebuilt packaged `params_pyx.so` containing the added parameter keys,
+    while retaining the `prebuilt` marker required by the deployment tree.
 
 The source diff from `sunny/dev` is approximately 32 modified or added source
 files, with about 937 insertions and 70 deletions, plus the deleted empty
@@ -66,6 +66,8 @@ include:
   that old local patch did not need a duplicate implementation.
 - the old eSIM modem-reboot hook no longer exists; upstream modem locking and
   ICCID-change handling supersede it.
+- `sunny/dev` intentionally omits SCons build files, so native changes must be
+  supplied as updated packaged artifacts rather than rebuilt by the launcher.
 
 See [DEV_ALX_PORT_REPORT.md](DEV_ALX_PORT_REPORT.md) for the commit mapping,
 adaptations, and validation report.

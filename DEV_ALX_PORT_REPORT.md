@@ -26,7 +26,7 @@ of flattening the work into one large integration commit.
 | `2b104bc20c` Show cellular network status on Mici home | `5abba70c80` |
 | `4e936e0c0b` Add network mode selector | `84cc4807b4`, adapted to the new modem architecture |
 | `ab1b1040ae` Add radar tracks to sunnylink settings | The old toggle metadata intent, represented on the current schema |
-| `a6f04a2b5e` Rebuild packaged source after port | New deployment compatibility commit required by the `sunny/dev` base |
+| `a6f04a2b5e` Rebuild packaged source after port | Initial attempt to invalidate upstream prebuilts; superseded by the packaged-artifact correction described below |
 
 Merge-only commits and version/release merges from `dev-alx` were not recreated.
 
@@ -105,11 +105,16 @@ Merge-only commits and version/release merges from `dev-alx` were not recreated.
 
 ### Packaged-build handling
 
-`sunny/dev` includes an empty `prebuilt` marker that tells the launcher to skip
-`build.py`. The port changes native parameter definitions and radar source, so
-the marker was removed in `a6f04a2b5e`. On a device this triggers a rebuild on
-the first launch; the existing quick-boot logic may create the marker again
-after a successful startup.
+`sunny/dev` includes a `prebuilt` marker because the deployment tree omits
+`SConstruct` and the SCons source-build description. Removing the marker causes
+`build.py` to fail with `No SConstruct file found`; this was confirmed during
+device deployment.
+
+The final port therefore restores the marker and carries a rebuilt aarch64
+`openpilot/common/params_pyx.so` containing the new `RadarTracks` and
+`NetworkMode` keys. Python source changes continue to run directly from the
+checkout, and the MRR35 DBC is generated dynamically by the current opendbc
+loader.
 
 ## Validation
 
@@ -118,6 +123,8 @@ Completed checks:
 - Git whitespace/error check over the complete port.
 - Python bytecode compilation for every changed Python module.
 - Sunnylink YAML-to-JSON compilation and generated-file consistency check.
+- On-device native params rebuild and smoke test for `RadarTracks`,
+  `NetworkMode`, and an existing key.
 - Static inspection of the branch ancestry, changed-file set, and commit
   boundaries.
 
@@ -129,10 +136,8 @@ jeepney are unavailable here.
 
 Recommended device/CI follow-up:
 
-1. Let the first-launch build finish and confirm the `prebuilt` marker is
-   recreated only after startup.
-2. Exercise Niro EV HDA2 radar parsing and verify lead/track overlay placement.
-3. Road-test stock-ACC curve entry, speed-limit anticipation, manual button
+1. Exercise Niro EV HDA2 radar parsing and verify lead/track overlay placement.
+2. Road-test stock-ACC curve entry, speed-limit anticipation, manual button
    override, and target release.
-4. Switch among Wi-Fi, cellular, and offline modes while checking PPP teardown,
+3. Switch among Wi-Fi, cellular, and offline modes while checking PPP teardown,
    reconnection, and Mici operator/status updates.
