@@ -20,7 +20,7 @@ from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.version import get_version
 from openpilot.system.loggerd.config import PARKING_BUFFER_DIR
-from openpilot.system.loggerd.parking_settings import PARKING_ROUTE_COUNT_PARAM, get_int, put_int
+from openpilot.system.loggerd.parking_settings import get_int, put_int
 
 BUFFER_SECONDS = 120.0
 POST_MOTION_SECONDS = 60.0
@@ -73,8 +73,8 @@ def _ts_duration_seconds(path: Path) -> float:
 
 
 def _write_route_qlog(path: Path, params: Params, start_wall_time_ns: int, duration: float) -> None:
-  # Connect discovers routes by parsing qlogs. These three messages match the
-  # metadata envelope loggerd writes for a single-segment route.
+  # Connect discovers routes and segment boundaries from qlogs. Match the
+  # loggerd envelope and include qcamera frame indices for the whole segment.
   start_mono_time_ns = time.monotonic_ns()
   init_msg = messaging.new_message("initData", valid=True)
   init_msg.logMonoTime = start_mono_time_ns
@@ -93,14 +93,36 @@ def _write_route_qlog(path: Path, params: Params, start_wall_time_ns: int, durat
   start_msg.logMonoTime = start_mono_time_ns
   start_msg.sentinel.type = "startOfRoute"
 
+  started_msg = messaging.new_message("deviceState", valid=True)
+  started_msg.logMonoTime = start_mono_time_ns
+  started_msg.deviceState.deviceType = HARDWARE.get_device_type()
+  started_msg.deviceState.started = True
+  started_msg.deviceState.startedMonoTime = start_mono_time_ns
+
   end_msg = messaging.new_message("sentinel", valid=True)
   end_msg.logMonoTime = start_mono_time_ns + int(duration * 1e9)
   end_msg.sentinel.type = "endOfRoute"
 
   tmp = path.with_suffix(".tmp")
   with tmp.open("wb") as output:
-    for msg in (init_msg, start_msg, end_msg):
+    for msg in (init_msg, start_msg, started_msg):
       output.write(msg.to_bytes())
+    for frame_id in range(max(1, round(duration * 20))):
+      timestamp_ns = start_mono_time_ns + frame_id * 50_000_000
+      index_msg = messaging.new_message("qRoadEncodeIdx", valid=True)
+      index_msg.logMonoTime = timestamp_ns
+      index = index_msg.qRoadEncodeIdx
+      index.frameId = frame_id
+      index.type = "qcameraH264"
+      index.encodeId = frame_id
+      index.segmentNum = 0
+      index.segmentId = frame_id
+      index.segmentIdEncode = frame_id
+      index.timestampSof = timestamp_ns
+      index.timestampEof = timestamp_ns
+      index.flags = V4L2_BUF_FLAG_KEYFRAME if frame_id % 100 == 0 else 0
+      output.write(index_msg.to_bytes())
+    output.write(end_msg.to_bytes())
   os.replace(tmp, path)
 
 
@@ -253,7 +275,39 @@ class ParkingRecorder:
 
     shutil.rmtree(self.buffer_dir, ignore_errors=True)
     self.events_dir.mkdir(parents=True)
+    self._migrate_legacy_routes()
     self._backfill_route_qlogs()
+
+  def _migrate_legacy_routes(self) -> None:
+    for legacy_dir in self.root.glob("800000*--0"):
+      source = legacy_dir / "qcamera.ts"
+      if not source.is_file():
+        continue
+      try:
+        if os.getxattr(source, "user.parking_migrated"):
+          continue
+      except OSError:
+        pass
+
+      route = self._new_route_name()
+      output_dir = self.root / f"{route}--0"
+      output = output_dir / "qcamera.ts"
+      lock = output_dir / "qcamera.ts.lock"
+      try:
+        output_dir.mkdir()
+        lock.touch()
+        shutil.copyfile(source, output)
+        duration = _ts_duration_seconds(output)
+        start_wall_time_ns = source.stat().st_mtime_ns - int(duration * 1e9)
+        _write_route_qlog(output_dir / "qlog", self.params, start_wall_time_ns, duration)
+        os.setxattr(source, "user.parking_migrated", route.encode())
+        self._mark_route_for_upload(route)
+        cloudlog.event("parking_route_migrated", source=str(legacy_dir), route=route)
+      except Exception:
+        cloudlog.exception("failed to migrate legacy parking route")
+        shutil.rmtree(output_dir, ignore_errors=True)
+      finally:
+        lock.unlink(missing_ok=True)
 
   def _backfill_route_qlogs(self) -> None:
     for output_dir in self.root.glob("800000*--0"):
@@ -274,9 +328,14 @@ class ParkingRecorder:
         lock.unlink(missing_ok=True)
 
   def _new_route_name(self) -> str:
-    count = get_int(self.params, PARKING_ROUTE_COUNT_PARAM)
-    put_int(self.params, PARKING_ROUTE_COUNT_PARAM, count + 1)
-    return f"{(0x80000000 + count) & 0xffffffff:08x}--{random.randbytes(5).hex()}"
+    count = get_int(self.params, "RouteCount")
+    put_int(self.params, "RouteCount", count + 1)
+    return f"{count & 0xffffffff:08x}--{random.randbytes(5).hex()}"
+
+  def _mark_route_for_upload(self, route: str) -> None:
+    routes = [r for r in (self.params.get("AthenadRecentlyViewedRoutes") or "").split(",") if r]
+    if route not in routes:
+      self.params.put("AthenadRecentlyViewedRoutes", ",".join([*routes[-99:], route]))
 
   def _start_chunk(self, now: float, header: bytes) -> None:
     path = self.buffer_dir / f"chunk-{time.monotonic_ns()}.h264"
@@ -392,9 +451,7 @@ class ParkingRecorder:
       start_wall_time_ns = output.stat().st_mtime_ns - int(duration * 1e9)
       _write_route_qlog(output_dir / "qlog", self.params, start_wall_time_ns, duration)
 
-      routes = [r for r in (self.params.get("AthenadRecentlyViewedRoutes") or "").split(",") if r]
-      if route not in routes:
-        self.params.put("AthenadRecentlyViewedRoutes", ",".join([*routes[-99:], route]))
+      self._mark_route_for_upload(route)
       cloudlog.event("parking_recording_saved", route=route, path=str(output))
     except Exception:
       cloudlog.exception("failed to save parking recording")

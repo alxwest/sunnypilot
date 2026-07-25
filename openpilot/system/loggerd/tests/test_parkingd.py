@@ -48,6 +48,7 @@ def test_recorder_keeps_prebuffer_and_saves_post_motion(tmp_path):
 
   outputs = list(tmp_path.glob("*--0/qcamera.ts"))
   assert len(outputs) == 1
+  assert (outputs[0].parent / "qlog").is_file()
   data = outputs[0].read_bytes()
   assert len(data) % 188 == 0
   assert all(data[i] == 0x47 for i in range(0, len(data), 188))
