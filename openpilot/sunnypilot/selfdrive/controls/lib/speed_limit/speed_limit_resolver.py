@@ -13,12 +13,15 @@ from openpilot.common.gps import get_gps_location_service
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD, get_sanitize_int_param
-from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import LIMIT_MAX_MAP_DATA_AGE, LIMIT_ADAPT_ACC
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import LIMIT_MAX_MAP_DATA_AGE
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Policy, OffsetType
 
 SpeedLimitSource = custom.LongitudinalPlanSP.SpeedLimit.Source
 
 ALL_SOURCES = tuple(SpeedLimitSource.schema.enumerants.values())
+STOCK_ACC_SPEED_LIMIT_DECEL = 0.6  # m/s^2, conservative stock ACC response for virtual-button speed sync.
+STOCK_ACC_SPEED_LIMIT_RESPONSE_TIME = 5.0
+SPEED_LIMIT_AHEAD_DISTANCE_BUFFER = 35.0
 
 
 class SpeedLimitResolver:
@@ -142,12 +145,14 @@ class SpeedLimitResolver:
     self.limit_solutions[SpeedLimitSource.map] = speed_limit
     self.distance_solutions[SpeedLimitSource.map] = 0.
 
-    # FIXME-SP: this is not working as expected
-    if 0. < next_speed_limit < self.v_ego:
-      adapt_time = (next_speed_limit - self.v_ego) / LIMIT_ADAPT_ACC
-      adapt_distance = self.v_ego * adapt_time + 0.5 * LIMIT_ADAPT_ACC * adapt_time ** 2
+    # Start using lower map-ahead limits early enough for stock ACC plus virtual button presses.
+    approach_speed = max(self.v_ego, speed_limit)
+    if 0. < next_speed_limit < approach_speed:
+      stock_acc_decel_distance = max(0., approach_speed ** 2 - next_speed_limit ** 2) / (2. * STOCK_ACC_SPEED_LIMIT_DECEL)
+      response_distance = approach_speed * STOCK_ACC_SPEED_LIMIT_RESPONSE_TIME
+      anticipation_distance = stock_acc_decel_distance + response_distance + SPEED_LIMIT_AHEAD_DISTANCE_BUFFER
 
-      if distance_to_speed_limit_ahead <= adapt_distance:
+      if distance_to_speed_limit_ahead <= anticipation_distance:
         self.limit_solutions[SpeedLimitSource.map] = next_speed_limit
         self.distance_solutions[SpeedLimitSource.map] = distance_to_speed_limit_ahead
 
