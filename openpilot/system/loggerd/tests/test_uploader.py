@@ -8,6 +8,7 @@ from openpilot.common.hardware.hw import Paths
 
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.loggerd.uploader import main, UPLOAD_ATTR_NAME, UPLOAD_ATTR_VALUE
+from openpilot.system.loggerd.config import PARKING_BUFFER_DIR
 
 from openpilot.system.loggerd.tests.loggerd_tests_common import UploaderTestCase
 
@@ -172,6 +173,13 @@ class TestUploader(UploaderTestCase):
     self.join_thread()
 
     assert len(log_handler.upload_order) == 0, "File uploaded again"
+
+  def test_parking_ring_buffer_is_not_uploaded(self):
+    self.make_file_with_data(PARKING_BUFFER_DIR, "chunk-1.h264", 0.1)
+    self.start_thread()
+    time.sleep(0.25)
+    self.join_thread()
+    assert len(log_handler.upload_order) == 0
 
   def test_clear_locks_on_startup(self):
     f_paths = self.gen_files(lock=True, boot=False)

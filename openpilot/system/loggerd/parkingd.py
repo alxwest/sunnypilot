@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import math
+import os
+import random
+import shutil
+import subprocess
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import BinaryIO
+
+import openpilot.cereal.messaging as messaging
+from openpilot.common.hardware.hw import Paths
+from openpilot.common.params import Params
+from openpilot.common.swaglog import cloudlog
+from openpilot.system.loggerd.config import PARKING_BUFFER_DIR
+from openpilot.system.loggerd.parking_settings import PARKING_ROUTE_COUNT_PARAM, get_int, put_int
+
+BUFFER_SECONDS = 120.0
+POST_MOTION_SECONDS = 60.0
+CHUNK_SECONDS = 5.0
+V4L2_BUF_FLAG_KEYFRAME = 0x8
+
+
+@dataclass(frozen=True)
+class Chunk:
+  path: Path
+  started_at: float
+
+
+class MotionDetector:
+  """Detect device movement and sustained changes in encoded scene complexity."""
+
+  def __init__(self) -> None:
+    self.accel_baseline: list[float] | None = None
+    self.warmup_samples = 0
+    self.imu_hits = 0
+    self.frame_size_ema: float | None = None
+    self.visual_hits = 0
+
+  def update_imu(self, acceleration: list[float] | None, gyro: list[float] | None) -> bool:
+    if acceleration is not None:
+      if self.accel_baseline is None:
+        self.accel_baseline = acceleration.copy()
+      delta = math.sqrt(sum((v - b) ** 2 for v, b in zip(acceleration, self.accel_baseline, strict=True)))
+      alpha = 0.002 if delta < 0.5 else 0.0001
+      self.accel_baseline = [(1.0 - alpha) * b + alpha * v for b, v in zip(self.accel_baseline, acceleration, strict=True)]
+    else:
+      delta = 0.0
+
+    gyro_norm = math.sqrt(sum(v * v for v in gyro)) if gyro is not None else 0.0
+    self.warmup_samples += 1
+    if self.warmup_samples < 200:
+      return False
+
+    self.imu_hits = self.imu_hits + 1 if delta > 1.5 or gyro_norm > 0.35 else 0
+    return self.imu_hits >= 2
+
+  def update_video(self, packet_size: int, keyframe: bool) -> bool:
+    if keyframe or packet_size <= 0:
+      return False
+    if self.frame_size_ema is None:
+      self.frame_size_ema = float(packet_size)
+      return False
+
+    ratio = packet_size / max(self.frame_size_ema, 1.0)
+    self.frame_size_ema = self.frame_size_ema * 0.98 + packet_size * 0.02
+    self.visual_hits = min(self.visual_hits + 1, 20) if ratio > 2.5 else max(self.visual_hits - 1, 0)
+    return self.visual_hits >= 6
+
+
+class ParkingRecorder:
+  def __init__(self, root: Path, params: Params) -> None:
+    self.root = root
+    self.params = params
+    self.buffer_dir = root / PARKING_BUFFER_DIR
+    self.events_dir = self.buffer_dir / "events"
+    self.chunks: deque[Chunk] = deque()
+    self.current: Chunk | None = None
+    self.current_file: BinaryIO | None = None
+    self.latest_header = b""
+    self.event_dir: Path | None = None
+    self.event_route: str | None = None
+    self.event_deadline = 0.0
+    self.event_chunk_count = 0
+    self.remux_threads: list[threading.Thread] = []
+
+    shutil.rmtree(self.buffer_dir, ignore_errors=True)
+    self.events_dir.mkdir(parents=True)
+
+  def _new_route_name(self) -> str:
+    count = get_int(self.params, PARKING_ROUTE_COUNT_PARAM)
+    put_int(self.params, PARKING_ROUTE_COUNT_PARAM, count + 1)
+    return f"{(0x80000000 + count) & 0xffffffff:08x}--{random.randbytes(5).hex()}"
+
+  def _start_chunk(self, now: float, header: bytes) -> None:
+    path = self.buffer_dir / f"chunk-{time.monotonic_ns()}.h264"
+    self.current_file = path.open("wb")
+    self.current_file.write(header)
+    self.current = Chunk(path, now)
+    self.chunks.append(self.current)
+    if self.event_dir is not None:
+      self._link_event_chunk(path)
+
+  def _close_chunk(self) -> None:
+    if self.current_file is not None:
+      self.current_file.flush()
+      self.current_file.close()
+    self.current_file = None
+    self.current = None
+
+  def _link_event_chunk(self, path: Path) -> None:
+    assert self.event_dir is not None
+    destination = self.event_dir / f"{self.event_chunk_count:04d}.h264"
+    if not destination.exists():
+      os.link(path, destination)
+      self.event_chunk_count += 1
+
+  def _trim_buffer(self, now: float) -> None:
+    while len(self.chunks) > 1 and self.chunks[1].started_at < now - BUFFER_SECONDS:
+      old = self.chunks.popleft()
+      # Active events hold hard links to their chunks, so unlinking the ring
+      # entry cannot remove footage that is waiting to be remuxed.
+      old.path.unlink(missing_ok=True)
+
+  def trigger(self, now: float, reason: str) -> None:
+    self.event_deadline = max(self.event_deadline, now + POST_MOTION_SECONDS)
+    if self.event_dir is not None:
+      return
+
+    self.event_route = self._new_route_name()
+    self.event_dir = self.events_dir / self.event_route
+    self.event_dir.mkdir()
+    self.event_chunk_count = 0
+    for chunk in self.chunks:
+      if chunk.started_at >= now - BUFFER_SECONDS - CHUNK_SECONDS:
+        self._link_event_chunk(chunk.path)
+    cloudlog.event("parking_motion_detected", reason=reason, route=self.event_route)
+
+  def add_packet(self, data: bytes, header: bytes, keyframe: bool, now: float) -> None:
+    if header:
+      self.latest_header = header
+    if self.current is None:
+      if not keyframe or not self.latest_header:
+        return
+      self._start_chunk(now, self.latest_header)
+    elif keyframe and now - self.current.started_at >= CHUNK_SECONDS:
+      self._close_chunk()
+      self._start_chunk(now, self.latest_header)
+
+    assert self.current_file is not None
+    self.current_file.write(data)
+    self._trim_buffer(now)
+
+    if self.event_dir is not None and now >= self.event_deadline and keyframe:
+      self._close_chunk()
+      self._finish_event()
+
+  def _finish_event(self) -> None:
+    assert self.event_dir is not None and self.event_route is not None
+    event_dir, route = self.event_dir, self.event_route
+    output_dir = self.root / f"{route}--0"
+    self.event_dir = None
+    self.event_route = None
+    self.event_deadline = 0.0
+    self.event_chunk_count = 0
+
+    thread = threading.Thread(target=self._remux_event, args=(event_dir, output_dir, route), daemon=True)
+    thread.start()
+    self.remux_threads.append(thread)
+
+  def _remux_event(self, event_dir: Path, output_dir: Path, route: str) -> None:
+    lock = output_dir / "qcamera.ts.lock"
+    output = output_dir / "qcamera.ts"
+    proc: subprocess.Popen | None = None
+    output_created = False
+    try:
+      output_dir.mkdir()
+      output_created = True
+      lock.touch()
+      cmd = ["ffmpeg", "-loglevel", "error", "-f", "h264", "-r", "20", "-i", "pipe:0",
+             "-c:v", "copy", "-f", "mpegts", str(output)]
+      proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+      assert proc.stdin is not None
+      for chunk in sorted(event_dir.glob("*.h264")):
+        with chunk.open("rb") as f:
+          shutil.copyfileobj(f, proc.stdin)
+      proc.stdin.close()
+      if proc.wait(timeout=30) != 0:
+        raise RuntimeError("ffmpeg failed to remux parking event")
+
+      routes = [r for r in (self.params.get("AthenadRecentlyViewedRoutes") or "").split(",") if r]
+      if route not in routes:
+        self.params.put("AthenadRecentlyViewedRoutes", ",".join([*routes[-99:], route]))
+      cloudlog.event("parking_recording_saved", route=route, path=str(output))
+    except Exception:
+      cloudlog.exception("failed to save parking recording")
+      if proc is not None and proc.poll() is None:
+        proc.kill()
+        proc.wait()
+      if output_created:
+        shutil.rmtree(output_dir, ignore_errors=True)
+    finally:
+      lock.unlink(missing_ok=True)
+      shutil.rmtree(event_dir, ignore_errors=True)
+
+  def close(self) -> None:
+    self._close_chunk()
+    if self.event_dir is not None:
+      self._finish_event()
+    for thread in self.remux_threads:
+      thread.join(timeout=35)
+
+
+def main() -> None:
+  params = Params()
+  recorder = ParkingRecorder(Path(Paths.log_root()), params)
+  detector = MotionDetector()
+  video_service = "livestreamRoadEncodeData"
+  sm = messaging.SubMaster([video_service, "accelerometer", "gyroscope"], poll=video_service)
+
+  try:
+    while True:
+      sm.update(1000)
+      now = time.monotonic()
+
+      acceleration = list(sm["accelerometer"].acceleration.v) if sm.updated["accelerometer"] else None
+      gyro = list(sm["gyroscope"].gyroUncalibrated.v) if sm.updated["gyroscope"] else None
+      if detector.update_imu(acceleration, gyro):
+        recorder.trigger(now, "imu")
+
+      if not sm.updated[video_service]:
+        continue
+      packet = sm[video_service]
+      keyframe = bool(packet.idx.flags & V4L2_BUF_FLAG_KEYFRAME)
+      data = bytes(packet.data)
+      if detector.update_video(len(data), keyframe):
+        recorder.trigger(now, "camera")
+      recorder.add_packet(data, bytes(packet.header), keyframe, now)
+  finally:
+    recorder.close()
+
+
+if __name__ == "__main__":
+  main()

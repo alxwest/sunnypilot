@@ -18,6 +18,7 @@ from openpilot.common.realtime import set_core_affinity
 from openpilot.common.hardware.hw import Paths
 from openpilot.system.loggerd.xattr_cache import getxattr, setxattr
 from openpilot.common.swaglog import cloudlog
+from openpilot.system.loggerd.config import PARKING_BUFFER_DIR
 
 NetworkType = log.DeviceState.NetworkType
 UPLOAD_ATTR_NAME = 'user.upload'
@@ -53,7 +54,7 @@ def listdir_by_creation(d: str) -> list[str]:
     return []
 
   try:
-    paths = [f for f in os.listdir(d) if os.path.isdir(os.path.join(d, f))]
+    paths = [f for f in os.listdir(d) if f != PARKING_BUFFER_DIR and os.path.isdir(os.path.join(d, f))]
     paths = sorted(paths, key=get_directory_sort)
     return paths
   except OSError:

@@ -34,8 +34,13 @@ sections:
     description: Display speed in km/h instead of mph.
 - id: recording
   title: Recording
-  description: Camera and audio recording during drives
+  description: Camera and audio recording
   items:
+  - key: ParkingMotionRecording
+    widget: toggle
+    title: Parking Motion Recording
+    description: Keep a two-minute low-bandwidth road-camera buffer while parked. When camera or device motion is detected,
+      save the buffer plus one additional minute and upload it when connected. This increases offroad power use.
   - key: RecordFront
     widget: toggle
     needs_onroad_cycle: true

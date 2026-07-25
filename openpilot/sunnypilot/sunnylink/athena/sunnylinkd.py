@@ -34,6 +34,7 @@ from openpilot.sunnypilot.sunnylink.api import SunnylinkApi
 from openpilot.sunnypilot.sunnylink.utils import sunnylink_need_register, sunnylink_ready, get_param_as_byte, save_param_from_base64_encoded_string
 from openpilot.sunnypilot.sunnylink.capabilities import generate_capabilities, CAPABILITY_LABELS
 from openpilot.sunnypilot.sunnylink.tools.generate_settings_schema import generate_schema
+from openpilot.system.loggerd.parking_settings import PARKING_ENABLED_PARAM, get_bool as get_parking_setting, put_bool as put_parking_setting
 
 SUNNYLINK_ATHENA_HOST = os.getenv('SUNNYLINK_ATHENA_HOST', 'wss://athena.sunnylink.ai')
 HANDLER_THREADS = int(os.getenv('HANDLER_THREADS', "4"))
@@ -166,7 +167,7 @@ def toggleLogUpload(enabled: bool):
 @dispatcher.add_method
 def getParamsAllKeys() -> list[str]:
   keys: list[str] = [k.decode('utf-8') for k in Params().all_keys()]
-  return keys
+  return sorted(set(keys) | {PARKING_ENABLED_PARAM})
 
 
 @dispatcher.add_method
@@ -192,7 +193,7 @@ def getParamsMetadata() -> str:
 @dispatcher.add_method
 def getParams(params_keys: list[str], compression: bool = False) -> str | dict[str, str]:
   params = Params()
-  available_keys: list[str] = [k.decode('utf-8') for k in Params().all_keys()]
+  available_keys = getParamsAllKeys()
 
   try:
     zero_values: dict[int, bytes] = {
@@ -208,6 +209,16 @@ def getParams(params_keys: list[str], compression: bool = False) -> str | dict[s
     param_keys_validated = [key for key in params_keys if key in available_keys]
     params_dict: dict[str, list[dict[str, str | bool | int]]] = {"params": []}
     for key in param_keys_validated:
+      if key == PARKING_ENABLED_PARAM:
+        value = b"1" if get_parking_setting(params, key) else b"0"
+        params_dict["params"].append({
+          "key": key,
+          "value": base64.b64encode(gzip.compress(value) if compression else value).decode("utf-8"),
+          "type": int(ParamKeyType.BOOL.value),
+          "is_compressed": compression,
+        })
+        continue
+
       value = get_param_as_byte(key)
       if value is None:
         value = get_param_as_byte(key, get_default=True)
@@ -240,6 +251,14 @@ def saveParams(params_to_update: dict[str, str], compression: bool = False) -> N
       continue
 
     try:
+      if key == PARKING_ENABLED_PARAM:
+        raw_value = base64.b64decode(value)
+        if compression:
+          raw_value = gzip.decompress(raw_value)
+        if raw_value not in (b"0", b"1"):
+          raise ValueError(f"Invalid boolean value for {key}")
+        put_parking_setting(params, key, raw_value == b"1")
+        continue
       save_param_from_base64_encoded_string(key, value, compression)
     except Exception as e:
       cloudlog.error(f"sunnylinkd.saveParams.exception {e}")
