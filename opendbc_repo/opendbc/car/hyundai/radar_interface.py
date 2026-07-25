@@ -3,30 +3,42 @@ import math
 from opendbc.can import CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.interfaces import RadarInterfaceBase
-from opendbc.car.hyundai.values import DBC
+from opendbc.car.hyundai.hyundaicanfd import CanBus
+from opendbc.car.hyundai.values import DBC, HyundaiFlags
 
 from opendbc.sunnypilot.car.hyundai.radar_interface_ext import RadarInterfaceExt
 
 RADAR_START_ADDR = 0x500
 RADAR_MSG_COUNT = 32
+MRR35_RADAR_ADDR = 0x3A5
+MRR35_RADAR_MSG_COUNT = 32
 
 # POC for parsing corner radars: https://github.com/commaai/openpilot/pull/24221/
+
+
+def get_radar_config(CP) -> tuple[int, int, int]:
+  if CP.flags & HyundaiFlags.MRR35_RADAR:
+    return MRR35_RADAR_ADDR, MRR35_RADAR_MSG_COUNT, CanBus(CP).ACAN
+  return RADAR_START_ADDR, RADAR_MSG_COUNT, 1
 
 
 def get_radar_can_parser(CP):
   if Bus.radar not in DBC[CP.carFingerprint]:
     return None
 
-  messages = [(f"RADAR_TRACK_{addr:x}", 50) for addr in range(RADAR_START_ADDR, RADAR_START_ADDR + RADAR_MSG_COUNT)]
-  return CANParser(DBC[CP.carFingerprint][Bus.radar], messages, 1)
+  radar_start_addr, radar_msg_count, radar_bus = get_radar_config(CP)
+  frequency = float('nan') if CP.flags & HyundaiFlags.MRR35_RADAR else 50
+  messages = [(f"RADAR_TRACK_{addr:x}", frequency) for addr in range(radar_start_addr, radar_start_addr + radar_msg_count)]
+  return CANParser(DBC[CP.carFingerprint][Bus.radar], messages, radar_bus)
 
 
 class RadarInterface(RadarInterfaceBase, RadarInterfaceExt):
   def __init__(self, CP, CP_SP):
     RadarInterfaceBase.__init__(self, CP, CP_SP)
     RadarInterfaceExt.__init__(self, CP, CP_SP)
+    self.radar_start_addr, self.radar_msg_count, _ = get_radar_config(CP)
     self.updated_messages = set()
-    self.trigger_msg = RADAR_START_ADDR + RADAR_MSG_COUNT - 1
+    self.trigger_msg = self.radar_start_addr if CP.flags & HyundaiFlags.MRR35_RADAR else self.radar_start_addr + self.radar_msg_count - 1
 
     self.radar_off_can = CP.radarUnavailable
     self.rcp = get_radar_can_parser(CP)
@@ -60,7 +72,7 @@ class RadarInterface(RadarInterfaceBase, RadarInterfaceExt):
     if self.use_radar_interface_ext:
       return self.update_ext(ret)
 
-    for addr in range(RADAR_START_ADDR, RADAR_START_ADDR + RADAR_MSG_COUNT):
+    for addr in range(self.radar_start_addr, self.radar_start_addr + self.radar_msg_count):
       msg = self.rcp.vl[f"RADAR_TRACK_{addr:x}"]
 
       if addr not in self.pts:
@@ -70,9 +82,14 @@ class RadarInterface(RadarInterfaceBase, RadarInterfaceExt):
 
       valid = msg['STATE'] in (3, 4)
       if valid:
-        azimuth = math.radians(msg['AZIMUTH'])
-        self.pts[addr].dRel = math.cos(azimuth) * msg['LONG_DIST']
-        self.pts[addr].yRel = 0.5 * -math.sin(azimuth) * msg['LONG_DIST']
+        if self.CP.flags & HyundaiFlags.MRR35_RADAR:
+          self.pts[addr].dRel = msg['LONG_DIST']
+          self.pts[addr].yRel = msg['LAT_DIST']
+          self.pts[addr].aRel = msg['REL_ACCEL']
+        else:
+          azimuth = math.radians(msg['AZIMUTH'])
+          self.pts[addr].dRel = math.cos(azimuth) * msg['LONG_DIST']
+          self.pts[addr].yRel = 0.5 * -math.sin(azimuth) * msg['LONG_DIST']
         self.pts[addr].vRel = msg['REL_SPEED']
 
       else:

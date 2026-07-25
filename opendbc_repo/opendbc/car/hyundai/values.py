@@ -148,6 +148,7 @@ class HyundaiFlags(IntFlag):
   FCEV = 2 ** 25
 
   ALT_LIMITS_2 = 2 ** 26
+  MRR35_RADAR = 2 ** 27
 
 
 @dataclass
@@ -191,6 +192,9 @@ class HyundaiCanFDPlatformConfig(PlatformConfig):
 
   def init(self):
     self.flags |= HyundaiFlags.CANFD
+
+    if self.flags & HyundaiFlags.MRR35_RADAR:
+      self.dbc_dict = {Bus.pt: "hyundai_canfd_generated", Bus.radar: "hyundai_mrr35_radar_generated"}
 
 
 class CAR(Platforms):
@@ -454,7 +458,7 @@ class CAR(Platforms):
       HyundaiCarDocs("Kia Niro EV (with HDA II) 2024-25", "Highway Driving Assist II", car_parts=CarParts.common([CarHarness.hyundai_r])),
     ],
     KIA_NIRO_EV.specs,
-    flags=HyundaiFlags.EV,
+    flags=HyundaiFlags.EV | HyundaiFlags.MRR35_RADAR,
   )
   KIA_NIRO_PHEV = HyundaiPlatformConfig(
     [
