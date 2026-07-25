@@ -7,10 +7,12 @@ See the LICENSE.md file in the root directory for more details.
 from typing import Any
 
 from opendbc.car import structs
+from opendbc.car.hyundai.values import CAR as HYUNDAI, HyundaiFlags
 from opendbc.car.interfaces import CarInterfaceBase
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.helpers import get_nn_model_path
+from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.common import Policy as SpeedLimitPolicy
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.helpers import set_speed_limit_assist_availability
 
 import openpilot.system.sentry as sentry
@@ -92,9 +94,35 @@ def _cleanup_unsupported_params(CP: structs.CarParams, CP_SP: structs.CarParamsS
   set_speed_limit_assist_availability(CP, CP_SP, params)
 
 
+def _is_niro_ev_hda2(CP: structs.CarParams) -> bool:
+  return (
+    CP.brand == "hyundai" and
+    CP.carFingerprint == HYUNDAI.KIA_NIRO_EV_2ND_GEN and
+    CP.alphaLongitudinalAvailable and
+    bool(CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG)
+  )
+
+
+def _initialize_niro_ev_hda2_features(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params: Params = None) -> None:
+  if params is None:
+    params = Params()
+
+  if _is_niro_ev_hda2(CP):
+    CP.radarUnavailable = False
+    params.put_bool_nonblocking("RadarTracks", True)
+
+    if CP_SP.intelligentCruiseButtonManagementAvailable and not CP.openpilotLongitudinalControl:
+      CP_SP.pcmCruiseSpeed = False
+      params.put_bool("IntelligentCruiseButtonManagement", True)
+      params.put("SpeedLimitPolicy", int(SpeedLimitPolicy.combined))
+      params.put_bool("SmartCruiseControlVision", True)
+      params.put_bool("SmartCruiseControlMap", True)
+
+
 def setup_interfaces(CI: CarInterfaceBase, params: Params = None) -> None:
   enforce_torque = _enforce_torque_lateral_control(CI.CP, params)
   nnlc_enabled = _initialize_neural_network_lateral_control(CI.CP, CI.CP_SP, params)
+  _initialize_niro_ev_hda2_features(CI.CP, CI.CP_SP, params)
   _initialize_intelligent_cruise_button_management(CI.CP, CI.CP_SP, params)
   _initialize_torque_lateral_control(CI, CI.CP, enforce_torque, nnlc_enabled)
   _cleanup_unsupported_params(CI.CP, CI.CP_SP)
