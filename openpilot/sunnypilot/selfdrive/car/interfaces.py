@@ -109,7 +109,7 @@ def _initialize_niro_ev_hda2_features(CP: structs.CarParams, CP_SP: structs.CarP
 
   if _is_niro_ev_hda2(CP):
     CP.radarUnavailable = False
-    params.put_bool_nonblocking("RadarTracks", True)
+    params.put_bool("RadarTracks", True)
 
     if CP_SP.intelligentCruiseButtonManagementAvailable and not CP.openpilotLongitudinalControl:
       CP_SP.pcmCruiseSpeed = False
