@@ -85,7 +85,6 @@ class RadarInterface(RadarInterfaceBase, RadarInterfaceExt):
         if self.CP.flags & HyundaiFlags.MRR35_RADAR:
           self.pts[addr].dRel = msg['LONG_DIST']
           self.pts[addr].yRel = msg['LAT_DIST']
-          self.pts[addr].aRel = msg['REL_ACCEL']
         else:
           azimuth = math.radians(msg['AZIMUTH'])
           self.pts[addr].dRel = math.cos(azimuth) * msg['LONG_DIST']
