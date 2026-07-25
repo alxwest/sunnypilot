@@ -145,6 +145,32 @@ class TestSmartCruiseControlVision:
       self.scc_v.update(self.sm, True, False, 0., 0., 0.)
     assert self.scc_v.state == VisionState.enabled
 
+  def test_leaving_state_is_not_clamped_by_curve_hold(self):
+    self.scc_v.is_active = True
+    self.scc_v.state = VisionState.leaving
+    self.scc_v.v_target = 12.0
+    self.scc_v.a_target = 0.5
+    self.scc_v.curve_decel_required = True
+    self.scc_v.curve_set_speed_target = 6.0
+    self.scc_v.curve_hold_frames = 10
+    self.scc_v.curve_hold_v_target = 6.0
+
+    assert self.scc_v.get_v_target_from_control() > self.scc_v.curve_hold_v_target
+
+  def test_transition_to_leaving_resets_curve_hold(self):
+    self.scc_v.state = VisionState.turning
+    self.scc_v.long_enabled = True
+    self.scc_v.enabled = True
+    self.scc_v.long_override = False
+    self.scc_v.current_lat_acc = 1.0
+    self.scc_v.curve_hold_frames = 10
+    self.scc_v.curve_hold_v_target = 6.0
+
+    self.scc_v._update_state_machine()
+
+    assert self.scc_v.state == VisionState.leaving
+    assert not self.scc_v._curve_hold_active
+
   @pytest.mark.parametrize(
     "case, should_enter",
     [
