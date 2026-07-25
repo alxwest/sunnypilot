@@ -476,9 +476,28 @@ def get_challenge_and_info(client: AtClient) -> tuple[bytes, bytes]:
   return challenge, info_resp
 
 
-def authenticate_server(client: AtClient, b64_signed1: str, b64_sig1: str, b64_pk_id: str, b64_cert: str, matching_id: str) -> str:
-  tac = bytes([0x35, 0x29, 0x06, 0x11])
-  device_info = encode_tlv(TAG_STATUS, tac) + encode_tlv(0xA1, b"")
+def get_modem_imei(client: AtClient) -> str:
+  imei = next((line.strip() for line in client.query("AT+CGSN") if line.strip().isdigit()), "")
+  if len(imei) != 15:
+    raise RuntimeError("Modem did not return a valid 15-digit IMEI")
+  return imei
+
+
+def encode_device_info(imei: str) -> bytes:
+  if len(imei) != 15 or not imei.isdigit():
+    raise ValueError("IMEI must contain 15 digits")
+
+  # SGP.22 §4.2: real TAC and IMEI in telephony BCD. The EG916Q-GL is an
+  # LTE-only Cat 1 bis modem implementing 3GPP Release 14.
+  tac = string_to_tbcd(imei[:8])
+  imei_bcd = string_to_tbcd(imei[:14]) + bytes([(int(imei[-1]) << 4) | 0x0F])
+  device_capabilities = encode_tlv(0x85, bytes([14, 0, 0]))  # eutranEpcSupportedRelease
+  return encode_tlv(TAG_STATUS, tac) + encode_tlv(0xA1, device_capabilities) + encode_tlv(0x82, imei_bcd)
+
+
+def authenticate_server(client: AtClient, b64_signed1: str, b64_sig1: str, b64_pk_id: str, b64_cert: str,
+                        matching_id: str, imei: str) -> str:
+  device_info = encode_device_info(imei)
   ctx_inner = encode_tlv(TAG_STATUS, matching_id.encode("utf-8")) + encode_tlv(0xA1, device_info)
   content = b64d(b64_signed1) + b64d(b64_sig1) + b64d(b64_pk_id) + b64d(b64_cert) + encode_tlv(0xA0, ctx_inner)
   response = es10x_command(client, encode_tlv(TAG_AUTH_SERVER, content))
@@ -636,10 +655,11 @@ def _cancel_session_safe(client: AtClient, smdp: str, tx_id: str, session: reque
     pass
 
 
-def download_profile(client: AtClient, activation_code: str, confirmation_code: str | None = None) -> str:
+def download_profile(client: AtClient, activation_code: str, confirmation_code: str | None = None, imei: str | None = None) -> str:
   """Download and install an eSIM profile. Returns the ICCID of the installed profile."""
   if not system_time_valid():
     raise RuntimeError("System time is not set; TLS certificate validation requires a valid clock")
+  imei = imei or get_modem_imei(client)
   smdp, matching_id = parse_lpa_activation_code(activation_code)
   challenge, euicc_info = get_challenge_and_info(client)
   session = requests.Session()
@@ -657,7 +677,7 @@ def download_profile(client: AtClient, activation_code: str, confirmation_code: 
     b64_auth = authenticate_server(client,
       _b64_field(auth, "serverSigned1"), _b64_field(auth, "serverSignature1"),
       _b64_field(auth, "euiccCiPKIdToBeUsed"), _b64_field(auth, "serverCertificate"),
-      matching_id)
+      matching_id, imei)
 
     # step 3: authenticate client + get metadata
     cli = es9p_request(smdp, "authenticateClient", {
