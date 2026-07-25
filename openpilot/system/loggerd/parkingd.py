@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import math
 import os
 import random
@@ -38,6 +39,14 @@ def _param_text(params: Params, key: str) -> str:
   if isinstance(value, bytes):
     return value.decode(errors="replace")
   return value or ""
+
+
+def _last_gps_position(params: Params) -> tuple[float, float, float] | None:
+  try:
+    position = json.loads(_param_text(params, "LastGPSPositionLLK"))
+    return float(position["latitude"]), float(position["longitude"]), float(position.get("altitude", 0.0))
+  except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    return None
 
 
 def _decode_pts(data: bytes) -> int:
@@ -99,10 +108,17 @@ def _write_route_qlog(path: Path, params: Params, start_wall_time_ns: int, durat
   started_msg.deviceState.started = True
   started_msg.deviceState.startedMonoTime = start_mono_time_ns
 
+  stopped_msg = messaging.new_message("deviceState", valid=True)
+  stopped_msg.logMonoTime = start_mono_time_ns + int(duration * 1e9)
+  stopped_msg.deviceState.deviceType = HARDWARE.get_device_type()
+  stopped_msg.deviceState.started = False
+
   end_msg = messaging.new_message("sentinel", valid=True)
   end_msg.logMonoTime = start_mono_time_ns + int(duration * 1e9)
   end_msg.sentinel.type = "endOfRoute"
 
+  gps_position = _last_gps_position(params)
+  start_wall_time_ms = start_wall_time_ns // 1_000_000
   tmp = path.with_suffix(".tmp")
   with tmp.open("wb") as output:
     for msg in (init_msg, start_msg, started_msg):
@@ -119,9 +135,30 @@ def _write_route_qlog(path: Path, params: Params, start_wall_time_ns: int, durat
       index.segmentId = frame_id
       index.segmentIdEncode = frame_id
       index.timestampSof = timestamp_ns
-      index.timestampEof = timestamp_ns
-      index.flags = V4L2_BUF_FLAG_KEYFRAME if frame_id % 100 == 0 else 0
+      index.timestampEof = timestamp_ns + 11_000_000
+      index.flags = 0x80004000 | (V4L2_BUF_FLAG_KEYFRAME if frame_id % 100 == 0 else 0)
       output.write(index_msg.to_bytes())
+      if frame_id % 20 == 0:
+        camera_msg = messaging.new_message("roadCameraState", valid=True)
+        camera_msg.logMonoTime = timestamp_ns + 12_000_000
+        camera_msg.roadCameraState.frameId = frame_id
+        camera_msg.roadCameraState.timestampSof = timestamp_ns
+        camera_msg.roadCameraState.timestampEof = timestamp_ns + 11_000_000
+        output.write(camera_msg.to_bytes())
+
+        if gps_position is not None:
+          gps_msg = messaging.new_message("gpsLocationExternal", valid=True)
+          gps_msg.logMonoTime = timestamp_ns
+          gps = gps_msg.gpsLocationExternal
+          gps.flags = 1
+          gps.latitude, gps.longitude, gps.altitude = gps_position
+          gps.horizontalAccuracy = 5.0
+          gps.unixTimestampMillis = start_wall_time_ms + frame_id * 50
+          gps.source = "qcomdiag"
+          gps.vNED = [0.0, 0.0, 0.0]
+          gps.hasFix = True
+          output.write(gps_msg.to_bytes())
+    output.write(stopped_msg.to_bytes())
     output.write(end_msg.to_bytes())
   os.replace(tmp, path)
 
@@ -284,7 +321,7 @@ class ParkingRecorder:
       if not source.is_file():
         continue
       try:
-        if os.getxattr(source, "user.parking_migrated"):
+        if os.getxattr(source, "user.parking_migrated").startswith(b"v2:"):
           continue
       except OSError:
         pass
@@ -300,7 +337,7 @@ class ParkingRecorder:
         duration = _ts_duration_seconds(output)
         start_wall_time_ns = source.stat().st_mtime_ns - int(duration * 1e9)
         _write_route_qlog(output_dir / "qlog", self.params, start_wall_time_ns, duration)
-        os.setxattr(source, "user.parking_migrated", route.encode())
+        os.setxattr(source, "user.parking_migrated", b"v2:" + route.encode())
         self._mark_route_for_upload(route)
         cloudlog.event("parking_route_migrated", source=str(legacy_dir), route=route)
       except Exception:
