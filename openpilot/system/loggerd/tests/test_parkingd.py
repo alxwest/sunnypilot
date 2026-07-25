@@ -14,15 +14,6 @@ def test_imu_motion_detector_triggers_after_warmup():
   assert detector.update_imu([2.0, 0.0, 9.81], [0.0, 0.0, 0.0])
 
 
-def test_video_motion_detector_requires_sustained_complexity_change():
-  detector = MotionDetector()
-  for _ in range(100):
-    assert not detector.update_video(1000, False)
-  for _ in range(5):
-    assert not detector.update_video(3000, False)
-  assert detector.update_video(3000, False)
-
-
 def test_recorder_keeps_prebuffer_and_saves_post_motion(tmp_path):
   class FakeParams:
     def __init__(self):

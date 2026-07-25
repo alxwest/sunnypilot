@@ -210,14 +210,12 @@ class Chunk:
 
 
 class MotionDetector:
-  """Detect device movement and sustained changes in encoded scene complexity."""
+  """Detect physical device movement from the accelerometer and gyroscope."""
 
   def __init__(self) -> None:
     self.accel_baseline: list[float] | None = None
     self.warmup_samples = 0
     self.imu_hits = 0
-    self.frame_size_ema: float | None = None
-    self.visual_hits = 0
 
   def update_imu(self, acceleration: list[float] | None, gyro: list[float] | None) -> bool:
     if acceleration is not None:
@@ -236,19 +234,6 @@ class MotionDetector:
 
     self.imu_hits = self.imu_hits + 1 if delta > 1.5 or gyro_norm > 0.35 else 0
     return self.imu_hits >= 2
-
-  def update_video(self, packet_size: int, keyframe: bool) -> bool:
-    if keyframe or packet_size <= 0:
-      return False
-    if self.frame_size_ema is None:
-      self.frame_size_ema = float(packet_size)
-      return False
-
-    ratio = packet_size / max(self.frame_size_ema, 1.0)
-    self.frame_size_ema = self.frame_size_ema * 0.98 + packet_size * 0.02
-    self.visual_hits = min(self.visual_hits + 1, 20) if ratio > 2.5 else max(self.visual_hits - 1, 0)
-    return self.visual_hits >= 6
-
 
 class ParkingRecorder:
   def __init__(self, root: Path, params: Params) -> None:
@@ -449,8 +434,6 @@ def main() -> None:
       packet = sm[video_service]
       keyframe = bool(packet.idx.flags & V4L2_BUF_FLAG_KEYFRAME)
       data = bytes(packet.data)
-      if detector.update_video(len(data), keyframe):
-        recorder.trigger(now, "camera")
       recorder.add_packet(data, bytes(packet.header), keyframe, now)
   finally:
     recorder.close()
