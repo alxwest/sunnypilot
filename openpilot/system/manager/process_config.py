@@ -165,7 +165,7 @@ procs = [
   PythonProcess("tombstoned", "openpilot.system.tombstoned", always_run, enabled=not PC),
   PythonProcess("updated", "openpilot.system.updated.updated", only_offroad, enabled=not PC),
   PythonProcess("uploader", "openpilot.system.loggerd.uploader", uploader_ready),
-  PythonProcess("parkingd", "openpilot.system.loggerd.parkingd", parking_recording),
+  PythonProcess("parkingd", "openpilot.system.loggerd.parkingd", parking_recording, restart_if_crash=True),
   PythonProcess("statsd", "openpilot.sunnypilot.system.statsd", always_run),
   PythonProcess("feedbackd", "openpilot.selfdrive.ui.feedback.feedbackd", only_onroad),
 
