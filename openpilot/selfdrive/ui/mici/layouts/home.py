@@ -9,14 +9,19 @@ from openpilot.system.ui.widgets.layouts import HBoxLayout
 from openpilot.system.ui.widgets.icon_widget import IconWidget
 from openpilot.system.ui.widgets.label import UnifiedLabel, gui_label
 from openpilot.system.ui.lib.application import gui_app, FontWeight, MousePos
+from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.common.version import RELEASE_BRANCHES
 
 HEAD_BUTTON_FONT_SIZE = 40
 HOME_PADDING = 8
 ALERTS_ZONE_WIDTH = 180
+NETWORK_NAME_FONT_SIZE = 34
+NETWORK_NAME_MAX_WIDTH = 220
+NETWORK_NAME_SPACING = 10
 
 NetworkType = log.DeviceState.NetworkType
+CELLULAR_NETWORK_TYPES = (NetworkType.cell2G, NetworkType.cell3G, NetworkType.cell4G, NetworkType.cell5G)
 
 NETWORK_TYPES = {
   NetworkType.none: "Offline",
@@ -125,6 +130,57 @@ class NetworkIcon(Widget):
     rl.draw_texture_ex(draw_net_txt, rl.Vector2(draw_x, draw_y), 0.0, 1.0, rl.Color(255, 255, 255, int(255 * 0.9)))
 
 
+class NetworkStatus(Widget):
+  def __init__(self):
+    super().__init__()
+    self._network_icon = self._child(NetworkIcon())
+    self._network_name_label = self._child(UnifiedLabel("", font_size=NETWORK_NAME_FONT_SIZE, font_weight=FontWeight.ROMAN,
+                                                        text_color=rl.Color(255, 255, 255, int(255 * 0.9)),
+                                                        alignment_vertical=rl.GuiTextAlignmentVertical.TEXT_ALIGN_MIDDLE,
+                                                        max_width=NETWORK_NAME_MAX_WIDTH, wrap_text=False))
+    self._network_name = ""
+    self._network_name_width = 0
+    self.set_rect(rl.Rectangle(0, 0, self._network_icon.rect.width, 48))
+
+  def refresh(self):
+    device_state = ui_state.sm['deviceState']
+    network_name = ""
+    if device_state.networkType in CELLULAR_NETWORK_TYPES:
+      try:
+        network_name = str(device_state.networkInfo.operator).strip()
+      except Exception:
+        network_name = ""
+      network_name = network_name or NETWORK_TYPES.get(device_state.networkType, "Cellular")
+
+    if network_name != self._network_name:
+      self._network_name = network_name
+      self._network_name_label.set_text(network_name)
+
+    if self._network_name:
+      text_size = measure_text_cached(gui_app.font(FontWeight.ROMAN), self._network_name, NETWORK_NAME_FONT_SIZE)
+      self._network_name_width = min(NETWORK_NAME_MAX_WIDTH, int(text_size.x) + 2)
+    else:
+      self._network_name_width = 0
+
+    width = self._network_icon.rect.width
+    if self._network_name_width > 0:
+      width += NETWORK_NAME_SPACING + self._network_name_width
+    self.set_rect(rl.Rectangle(self._rect.x, self._rect.y, width, 48))
+
+  def _update_state(self):
+    self.refresh()
+
+  def _render(self, rect):
+    icon_rect = rl.Rectangle(rect.x, rect.y + (rect.height - self._network_icon.rect.height) / 2,
+                             self._network_icon.rect.width, self._network_icon.rect.height)
+    self._network_icon.render(icon_rect)
+
+    if self._network_name_width > 0:
+      label_rect = rl.Rectangle(rect.x + self._network_icon.rect.width + NETWORK_NAME_SPACING, rect.y,
+                                self._network_name_width, rect.height)
+      self._network_name_label.render(label_rect)
+
+
 class MiciHomeLayout(Widget):
   def __init__(self):
     super().__init__()
@@ -145,10 +201,11 @@ class MiciHomeLayout(Widget):
     self._body_icon = IconWidget("icons_mici/body.png", (54, 37))
 
     self._alerts_pill = AlertsPill()
+    self._network_status = NetworkStatus()
 
     self._status_bar_layout = HBoxLayout([
       IconWidget("icons_mici/settings.png", (48, 48), opacity=0.9),
-      NetworkIcon(),
+      self._network_status,
       self._experimental_icon,
       self._egpu_icon,
       self._egpu_icon_gray,

@@ -151,9 +151,6 @@ class Tici(HardwareBase):
     return self.get_modem_state().get('imei', '')
 
   def get_network_info(self):
-    if self.get_device_type() == "mici":
-      return None
-
     ms = self.get_modem_state()
     return {
       'technology': ms.get('network_type', '').upper() if ms.get('network_type') else '',
