@@ -1,7 +1,3 @@
-import io
-from pathlib import Path
-
-import openpilot.system.loggerd.parkingd as parkingd
 from openpilot.system.loggerd.parkingd import MotionDetector, ParkingRecorder
 
 
@@ -27,7 +23,7 @@ def test_video_motion_detector_requires_sustained_complexity_change():
   assert detector.update_video(3000, False)
 
 
-def test_recorder_keeps_prebuffer_and_saves_post_motion(tmp_path, monkeypatch):
+def test_recorder_keeps_prebuffer_and_saves_post_motion(tmp_path):
   class FakeParams:
     def __init__(self):
       self.values = {}
@@ -41,29 +37,14 @@ def test_recorder_keeps_prebuffer_and_saves_post_motion(tmp_path, monkeypatch):
     def put(self, key, value, block=False):
       self.values[key] = value
 
-  class FakeProcess:
-    def __init__(self, cmd, stdin):
-      self.stdin = io.BytesIO()
-      Path(cmd[-1]).touch()
-      self.returncode = None
-
-    def wait(self, timeout=None):
-      self.returncode = 0
-      return self.returncode
-
-    def poll(self):
-      return self.returncode
-
-    def kill(self):
-      self.returncode = -9
-
-  monkeypatch.setattr(parkingd.subprocess, "Popen", FakeProcess)
   params = FakeParams()
   recorder = ParkingRecorder(tmp_path, params)
+  header = b"\x00\x00\x00\x01\x67\x64\x00\x1f\x00\x00\x00\x01\x68\xee\x3c\x80"
+  frame = b"\x00\x00\x00\x01\x65\x88\x84"
 
   for second in range(131):
     keyframe = second % 5 == 0
-    recorder.add_packet(b"frame", b"header" if keyframe else b"", keyframe, float(second))
+    recorder.add_packet(frame, header if keyframe else b"", keyframe, float(second))
 
   recorder.trigger(130.0, "test")
   assert recorder.event_dir is not None
@@ -71,8 +52,12 @@ def test_recorder_keeps_prebuffer_and_saves_post_motion(tmp_path, monkeypatch):
 
   for second in range(131, 192):
     keyframe = second % 5 == 0
-    recorder.add_packet(b"frame", b"header" if keyframe else b"", keyframe, float(second))
+    recorder.add_packet(frame, header if keyframe else b"", keyframe, float(second))
   recorder.close()
 
-  assert len(list(tmp_path.glob("*--0/qcamera.ts"))) == 1
+  outputs = list(tmp_path.glob("*--0/qcamera.ts"))
+  assert len(outputs) == 1
+  data = outputs[0].read_bytes()
+  assert len(data) % 188 == 0
+  assert all(data[i] == 0x47 for i in range(0, len(data), 188))
   assert params.values["AthenadRecentlyViewedRoutes"]

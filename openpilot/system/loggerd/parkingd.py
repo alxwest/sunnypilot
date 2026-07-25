@@ -5,7 +5,7 @@ import math
 import os
 import random
 import shutil
-import subprocess
+import struct
 import threading
 import time
 from collections import deque
@@ -24,6 +24,110 @@ BUFFER_SECONDS = 120.0
 POST_MOTION_SECONDS = 60.0
 CHUNK_SECONDS = 5.0
 V4L2_BUF_FLAG_KEYFRAME = 0x8
+CHUNK_MAGIC = b"PKH1"
+TS_PACKET_SIZE = 188
+TS_PAT_PID = 0x0000
+TS_PMT_PID = 0x0100
+TS_VIDEO_PID = 0x0101
+
+
+def _mpeg_crc32(data: bytes) -> int:
+  crc = 0xffffffff
+  for value in data:
+    crc ^= value << 24
+    for _ in range(8):
+      crc = ((crc << 1) ^ 0x04c11db7) & 0xffffffff if crc & 0x80000000 else (crc << 1) & 0xffffffff
+  return crc
+
+
+def _psi_section(data: bytes) -> bytes:
+  return data + _mpeg_crc32(data).to_bytes(4, "big")
+
+
+def _encode_pts(pts: int) -> bytes:
+  pts &= (1 << 33) - 1
+  return bytes((
+    0x21 | (((pts >> 30) & 0x07) << 1),
+    (pts >> 22) & 0xff,
+    0x01 | (((pts >> 15) & 0x7f) << 1),
+    (pts >> 7) & 0xff,
+    0x01 | ((pts & 0x7f) << 1),
+  ))
+
+
+def _encode_pcr(pcr_base: int) -> bytes:
+  pcr_base &= (1 << 33) - 1
+  return bytes((
+    (pcr_base >> 25) & 0xff,
+    (pcr_base >> 17) & 0xff,
+    (pcr_base >> 9) & 0xff,
+    (pcr_base >> 1) & 0xff,
+    ((pcr_base & 1) << 7) | 0x7e,
+    0,
+  ))
+
+
+class MpegTsWriter:
+  def __init__(self, output: BinaryIO, fps: int = 20):
+    self.output = output
+    self.frame_duration = 90000 // fps
+    self.frame_count = 0
+    self.continuity: dict[int, int] = {}
+
+  def _write_packet(self, pid: int, payload: bytes, payload_start: bool, pcr: int | None = None,
+                    random_access: bool = False) -> None:
+    continuity = self.continuity.get(pid, 0)
+    self.continuity[pid] = (continuity + 1) & 0x0f
+
+    adaptation = b""
+    if pcr is not None:
+      adaptation_length = 183 - len(payload)
+      assert adaptation_length >= 7
+      flags = 0x10 | (0x40 if random_access else 0)
+      adaptation = bytes((adaptation_length, flags)) + _encode_pcr(pcr) + b"\xff" * (adaptation_length - 7)
+      adaptation_control = 3
+    elif len(payload) < 184:
+      adaptation_length = 183 - len(payload)
+      adaptation = bytes((adaptation_length,))
+      if adaptation_length:
+        adaptation += b"\x00" + b"\xff" * (adaptation_length - 1)
+      adaptation_control = 3
+    else:
+      adaptation_control = 1
+
+    header = bytes((
+      0x47,
+      ((0x40 if payload_start else 0) | ((pid >> 8) & 0x1f)),
+      pid & 0xff,
+      (adaptation_control << 4) | continuity,
+    ))
+    packet = header + adaptation + payload
+    assert len(packet) == TS_PACKET_SIZE
+    self.output.write(packet)
+
+  def _write_payload(self, pid: int, payload: bytes, pcr: int | None = None, random_access: bool = False) -> None:
+    first = True
+    while payload:
+      capacity = 176 if first and pcr is not None else 184
+      chunk, payload = payload[:capacity], payload[capacity:]
+      self._write_packet(pid, chunk, first, pcr if first else None, random_access if first else False)
+      first = False
+
+  def _write_program_tables(self) -> None:
+    pat = _psi_section(bytes.fromhex("00b00d0001c100000001e100"))
+    pmt = _psi_section(bytes.fromhex("02b0120001c10000e101f0001be101f000"))
+    self._write_payload(TS_PAT_PID, b"\x00" + pat)
+    self._write_payload(TS_PMT_PID, b"\x00" + pmt)
+
+  def write_frame(self, data: bytes) -> None:
+    if self.frame_count % 20 == 0:
+      self._write_program_tables()
+
+    pts = self.frame_count * self.frame_duration
+    pes = b"\x00\x00\x01\xe0\x00\x00\x80\x80\x05" + _encode_pts(pts) + data
+    random_access = b"\x00\x00\x00\x01\x65" in data or b"\x00\x00\x01\x65" in data
+    self._write_payload(TS_VIDEO_PID, pes, pcr=pts, random_access=random_access)
+    self.frame_count += 1
 
 
 @dataclass(frozen=True)
@@ -100,6 +204,8 @@ class ParkingRecorder:
   def _start_chunk(self, now: float, header: bytes) -> None:
     path = self.buffer_dir / f"chunk-{time.monotonic_ns()}.h264"
     self.current_file = path.open("wb")
+    self.current_file.write(CHUNK_MAGIC)
+    self.current_file.write(struct.pack(">I", len(header)))
     self.current_file.write(header)
     self.current = Chunk(path, now)
     self.chunks.append(self.current)
@@ -153,6 +259,7 @@ class ParkingRecorder:
       self._start_chunk(now, self.latest_header)
 
     assert self.current_file is not None
+    self.current_file.write(struct.pack(">I", len(data)))
     self.current_file.write(data)
     self._trim_buffer(now)
 
@@ -176,22 +283,33 @@ class ParkingRecorder:
   def _remux_event(self, event_dir: Path, output_dir: Path, route: str) -> None:
     lock = output_dir / "qcamera.ts.lock"
     output = output_dir / "qcamera.ts"
-    proc: subprocess.Popen | None = None
     output_created = False
     try:
       output_dir.mkdir()
       output_created = True
       lock.touch()
-      cmd = ["ffmpeg", "-loglevel", "error", "-f", "h264", "-r", "20", "-i", "pipe:0",
-             "-c:v", "copy", "-f", "mpegts", str(output)]
-      proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-      assert proc.stdin is not None
-      for chunk in sorted(event_dir.glob("*.h264")):
-        with chunk.open("rb") as f:
-          shutil.copyfileobj(f, proc.stdin)
-      proc.stdin.close()
-      if proc.wait(timeout=30) != 0:
-        raise RuntimeError("ffmpeg failed to remux parking event")
+      with output.open("wb") as output_file:
+        writer = MpegTsWriter(output_file)
+        for chunk in sorted(event_dir.glob("*.h264")):
+          with chunk.open("rb") as chunk_file:
+            if chunk_file.read(len(CHUNK_MAGIC)) != CHUNK_MAGIC:
+              raise ValueError(f"Invalid parking chunk {chunk}")
+            header_size_data = chunk_file.read(4)
+            if len(header_size_data) != 4:
+              raise ValueError(f"Truncated parking chunk header {chunk}")
+            header = chunk_file.read(struct.unpack(">I", header_size_data)[0])
+            first_frame = True
+            while frame_size_data := chunk_file.read(4):
+              if len(frame_size_data) != 4:
+                raise ValueError(f"Truncated parking frame size {chunk}")
+              frame_size = struct.unpack(">I", frame_size_data)[0]
+              frame = chunk_file.read(frame_size)
+              if len(frame) != frame_size:
+                raise ValueError(f"Truncated parking frame {chunk}")
+              writer.write_frame((header if first_frame else b"") + frame)
+              first_frame = False
+        if writer.frame_count == 0:
+          raise ValueError("Parking event contained no video frames")
 
       routes = [r for r in (self.params.get("AthenadRecentlyViewedRoutes") or "").split(",") if r]
       if route not in routes:
@@ -199,9 +317,6 @@ class ParkingRecorder:
       cloudlog.event("parking_recording_saved", route=route, path=str(output))
     except Exception:
       cloudlog.exception("failed to save parking recording")
-      if proc is not None and proc.poll() is None:
-        proc.kill()
-        proc.wait()
       if output_created:
         shutil.rmtree(output_dir, ignore_errors=True)
     finally:
