@@ -26,6 +26,7 @@ from openpilot.system.loggerd.parking_settings import get_int, put_int
 BUFFER_SECONDS = 120.0
 POST_MOTION_SECONDS = 60.0
 CHUNK_SECONDS = 5.0
+SEGMENT_SECONDS = 60.0
 V4L2_BUF_FLAG_KEYFRAME = 0x8
 CHUNK_MAGIC = b"PKH2"
 TS_PACKET_SIZE = 188
@@ -47,38 +48,6 @@ def _last_gps_position(params: Params) -> tuple[float, float, float] | None:
     return float(position["latitude"]), float(position["longitude"]), float(position.get("altitude", 0.0))
   except (KeyError, TypeError, ValueError, json.JSONDecodeError):
     return None
-
-
-def _decode_pts(data: bytes) -> int:
-  return (((data[0] >> 1) & 0x07) << 30) | (data[1] << 22) | \
-         ((data[2] >> 1) << 15) | (data[3] << 7) | (data[4] >> 1)
-
-
-def _ts_duration_seconds(path: Path) -> float:
-  first_pts: int | None = None
-  last_pts: int | None = None
-  with path.open("rb") as stream:
-    while packet := stream.read(TS_PACKET_SIZE):
-      if len(packet) != TS_PACKET_SIZE or packet[0] != 0x47:
-        continue
-      pid = ((packet[1] & 0x1f) << 8) | packet[2]
-      if pid != TS_VIDEO_PID or not packet[1] & 0x40:
-        continue
-      adaptation_control = (packet[3] >> 4) & 0x03
-      if adaptation_control not in (1, 3):
-        continue
-      offset = 4
-      if adaptation_control == 3:
-        offset += 1 + packet[offset]
-      payload = packet[offset:]
-      if len(payload) < 14 or payload[:4] != b"\x00\x00\x01\xe0" or not payload[7] & 0x80:
-        continue
-      pts = _decode_pts(payload[9:14])
-      first_pts = pts if first_pts is None else first_pts
-      last_pts = pts
-  if first_pts is None or last_pts is None:
-    return 0.0
-  return max(0.0, (last_pts - first_pts) / 90000.0 + 1.0 / 20.0)
 
 
 def _read_ts_frames(path: Path):
@@ -109,26 +78,37 @@ def _read_ts_frames(path: Path):
     yield bytes(pes[header_size:])
 
 
-def _retime_parking_ts(source: Path, output: Path) -> list[int]:
-  frame_timestamps_ns: list[int] = []
+def _retime_parking_frames(source: Path) -> list[tuple[int, bytes]]:
+  frames: list[tuple[int, bytes]] = []
   start_timestamp_ns = time.monotonic_ns()
-  with output.open("wb") as output_file:
-    writer = MpegTsWriter(output_file)
-    for frame_id, frame in enumerate(_read_ts_frames(source)):
-      timestamp_ns = start_timestamp_ns + frame_id * 50_000_000
-      writer.write_frame(frame, timestamp_ns * 90000 // 1_000_000_000)
-      frame_timestamps_ns.append(timestamp_ns)
-  if not frame_timestamps_ns:
+  for frame_id, frame in enumerate(_read_ts_frames(source)):
+    frames.append((start_timestamp_ns + frame_id * 50_000_000, frame))
+  if not frames:
     raise ValueError(f"No video frames in {source}")
-  return frame_timestamps_ns
+  return frames
+
+
+def _is_keyframe(frame: bytes) -> bool:
+  return b"\x00\x00\x00\x01\x65" in frame or b"\x00\x00\x01\x65" in frame
+
+
+def _split_video_segments(frames: list[tuple[int, bytes]]) -> list[list[tuple[int, bytes]]]:
+  segments: list[list[tuple[int, bytes]]] = [[]]
+  for frame in frames:
+    current = segments[-1]
+    if current and (frame[0] - current[0][0]) / 1e9 >= SEGMENT_SECONDS and _is_keyframe(frame[1]):
+      segments.append([])
+    segments[-1].append(frame)
+  return segments
 
 
 def _write_route_qlog(path: Path, params: Params, start_wall_time_ns: int,
-                      frame_timestamps_ns: list[int]) -> None:
+                      frames: list[tuple[int, bytes]], segment_num: int,
+                      global_frame_offset: int, final_segment: bool) -> None:
   # Connect discovers routes and segment boundaries from qlogs. Match the
   # loggerd envelope and include qcamera frame indices for the whole segment.
-  start_mono_time_ns = frame_timestamps_ns[0]
-  end_mono_time_ns = frame_timestamps_ns[-1] + 50_000_000
+  start_mono_time_ns = frames[0][0]
+  end_mono_time_ns = frames[-1][0] + 50_000_000
   init_msg = messaging.new_message("initData", valid=True)
   init_msg.logMonoTime = start_mono_time_ns
   init = init_msg.initData
@@ -144,7 +124,7 @@ def _write_route_qlog(path: Path, params: Params, start_wall_time_ns: int,
 
   start_msg = messaging.new_message("sentinel", valid=True)
   start_msg.logMonoTime = start_mono_time_ns
-  start_msg.sentinel.type = "startOfRoute"
+  start_msg.sentinel.type = "startOfRoute" if segment_num == 0 else "startOfSegment"
 
   started_msg = messaging.new_message("deviceState", valid=True)
   started_msg.logMonoTime = start_mono_time_ns
@@ -159,7 +139,7 @@ def _write_route_qlog(path: Path, params: Params, start_wall_time_ns: int,
 
   end_msg = messaging.new_message("sentinel", valid=True)
   end_msg.logMonoTime = end_mono_time_ns
-  end_msg.sentinel.type = "endOfRoute"
+  end_msg.sentinel.type = "endOfRoute" if final_segment else "endOfSegment"
 
   gps_position = _last_gps_position(params)
   start_wall_time_ms = start_wall_time_ns // 1_000_000
@@ -167,21 +147,24 @@ def _write_route_qlog(path: Path, params: Params, start_wall_time_ns: int,
   with tmp.open("wb") as output:
     for msg in (init_msg, start_msg, started_msg):
       output.write(msg.to_bytes())
-    for frame_id, timestamp_ns in enumerate(frame_timestamps_ns):
+    for segment_frame_id, (timestamp_ns, frame) in enumerate(frames):
+      frame_id = global_frame_offset + segment_frame_id
       index_msg = messaging.new_message("qRoadEncodeIdx", valid=True)
       index_msg.logMonoTime = timestamp_ns
       index = index_msg.qRoadEncodeIdx
       index.frameId = frame_id
       index.type = "qcameraH264"
       index.encodeId = frame_id
-      index.segmentNum = 0
-      index.segmentId = frame_id
-      index.segmentIdEncode = frame_id
+      index.segmentNum = segment_num
+      index.segmentId = segment_frame_id
+      index.segmentIdEncode = segment_frame_id
       index.timestampSof = timestamp_ns - 11_000_000
       index.timestampEof = timestamp_ns
-      index.flags = 0x80004000 | (V4L2_BUF_FLAG_KEYFRAME if frame_id % 100 == 0 else 0)
+      keyframe = _is_keyframe(frame)
+      index.flags = 0x80004000 | (V4L2_BUF_FLAG_KEYFRAME if keyframe else 0)
+      index.len = len(frame)
       output.write(index_msg.to_bytes())
-      if frame_id % 20 == 0:
+      if segment_frame_id % 20 == 0:
         camera_msg = messaging.new_message("roadCameraState", valid=True)
         camera_msg.logMonoTime = timestamp_ns + 1_000_000
         camera_msg.roadCameraState.frameId = frame_id
@@ -201,7 +184,8 @@ def _write_route_qlog(path: Path, params: Params, start_wall_time_ns: int,
           gps.vNED = [0.0, 0.0, 0.0]
           gps.hasFix = True
           output.write(gps_msg.to_bytes())
-    output.write(stopped_msg.to_bytes())
+    if final_segment:
+      output.write(stopped_msg.to_bytes())
     output.write(end_msg.to_bytes())
   os.replace(tmp, path)
 
@@ -356,7 +340,6 @@ class ParkingRecorder:
     shutil.rmtree(self.buffer_dir, ignore_errors=True)
     self.events_dir.mkdir(parents=True)
     self._migrate_legacy_routes()
-    self._backfill_route_qlogs()
 
   def _migrate_legacy_routes(self) -> None:
     for legacy_dir in self.root.glob("800000*--0"):
@@ -364,49 +347,53 @@ class ParkingRecorder:
       if not source.is_file():
         continue
       try:
-        if os.getxattr(source, "user.parking_migrated").startswith(b"v3:"):
+        if os.getxattr(source, "user.parking_migrated").startswith(b"v4:"):
           continue
       except OSError:
         pass
 
       route = self._new_route_name()
-      output_dir = self.root / f"{route}--0"
-      output = output_dir / "qcamera.ts"
-      lock = output_dir / "qcamera.ts.lock"
       try:
-        output_dir.mkdir()
-        lock.touch()
-        frame_timestamps_ns = _retime_parking_ts(source, output)
-        duration = len(frame_timestamps_ns) / 20.0
+        frames = _retime_parking_frames(source)
+        duration = len(frames) / 20.0
         start_wall_time_ns = source.stat().st_mtime_ns - int(duration * 1e9)
-        _write_route_qlog(output_dir / "qlog", self.params, start_wall_time_ns, frame_timestamps_ns)
-        os.setxattr(source, "user.parking_migrated", b"v3:" + route.encode())
+        self._write_segmented_route(route, frames, start_wall_time_ns)
+        os.setxattr(source, "user.parking_migrated", b"v4:" + route.encode())
         self._mark_route_for_upload(route)
         cloudlog.event("parking_route_migrated", source=str(legacy_dir), route=route)
       except Exception:
         cloudlog.exception("failed to migrate legacy parking route")
-        shutil.rmtree(output_dir, ignore_errors=True)
-      finally:
-        lock.unlink(missing_ok=True)
 
-  def _backfill_route_qlogs(self) -> None:
-    for output_dir in self.root.glob("800000*--0"):
-      output = output_dir / "qcamera.ts"
-      qlog = output_dir / "qlog"
-      if not output.is_file() or qlog.exists() or (output_dir / "qlog.zst").exists():
-        continue
-      lock = output_dir / "qlog.lock"
-      try:
+  def _write_segmented_route(self, route: str, frames: list[tuple[int, bytes]],
+                             start_wall_time_ns: int) -> list[Path]:
+    segments = _split_video_segments(frames)
+    output_dirs: list[Path] = []
+    locks: list[Path] = []
+    global_frame_offset = 0
+    try:
+      for segment_num, segment_frames in enumerate(segments):
+        output_dir = self.root / f"{route}--{segment_num}"
+        output_dir.mkdir()
+        output_dirs.append(output_dir)
+        lock = output_dir / "qcamera.ts.lock"
         lock.touch()
-        duration = _ts_duration_seconds(output)
-        start_wall_time_ns = output.stat().st_mtime_ns - int(duration * 1e9)
-        start_timestamp_ns = time.monotonic_ns()
-        frame_timestamps_ns = [start_timestamp_ns + i * 50_000_000 for i in range(max(1, round(duration * 20)))]
-        _write_route_qlog(qlog, self.params, start_wall_time_ns, frame_timestamps_ns)
-        cloudlog.event("parking_qlog_backfilled", path=str(qlog))
-      except Exception:
-        cloudlog.exception("failed to backfill parking qlog")
-      finally:
+        locks.append(lock)
+
+        with (output_dir / "qcamera.ts").open("wb") as output_file:
+          writer = MpegTsWriter(output_file)
+          for timestamp_eof_ns, frame in segment_frames:
+            writer.write_frame(frame, timestamp_eof_ns * 90000 // 1_000_000_000)
+
+        _write_route_qlog(output_dir / "qlog", self.params, start_wall_time_ns, segment_frames,
+                          segment_num, global_frame_offset, segment_num == len(segments) - 1)
+        global_frame_offset += len(segment_frames)
+      return output_dirs
+    except Exception:
+      for output_dir in output_dirs:
+        shutil.rmtree(output_dir, ignore_errors=True)
+      raise
+    finally:
+      for lock in locks:
         lock.unlink(missing_ok=True)
 
   def _new_route_name(self) -> str:
@@ -488,62 +475,47 @@ class ParkingRecorder:
   def _finish_event(self) -> None:
     assert self.event_dir is not None and self.event_route is not None
     event_dir, route = self.event_dir, self.event_route
-    output_dir = self.root / f"{route}--0"
     self.event_dir = None
     self.event_route = None
     self.event_deadline = 0.0
     self.event_chunk_count = 0
 
-    thread = threading.Thread(target=self._remux_event, args=(event_dir, output_dir, route), daemon=True)
+    thread = threading.Thread(target=self._remux_event, args=(event_dir, route), daemon=True)
     thread.start()
     self.remux_threads.append(thread)
 
-  def _remux_event(self, event_dir: Path, output_dir: Path, route: str) -> None:
-    lock = output_dir / "qcamera.ts.lock"
-    output = output_dir / "qcamera.ts"
-    output_created = False
+  def _remux_event(self, event_dir: Path, route: str) -> None:
     try:
-      output_dir.mkdir()
-      output_created = True
-      lock.touch()
-      with output.open("wb") as output_file:
-        writer = MpegTsWriter(output_file)
-        frame_timestamps_ns: list[int] = []
-        for chunk in sorted(event_dir.glob("*.h264")):
-          with chunk.open("rb") as chunk_file:
-            if chunk_file.read(len(CHUNK_MAGIC)) != CHUNK_MAGIC:
-              raise ValueError(f"Invalid parking chunk {chunk}")
-            header_size_data = chunk_file.read(4)
-            if len(header_size_data) != 4:
-              raise ValueError(f"Truncated parking chunk header {chunk}")
-            header = chunk_file.read(struct.unpack(">I", header_size_data)[0])
-            first_frame = True
-            while frame_metadata := chunk_file.read(12):
-              if len(frame_metadata) != 12:
-                raise ValueError(f"Truncated parking frame metadata {chunk}")
-              timestamp_eof_ns, frame_size = struct.unpack(">QI", frame_metadata)
-              frame = chunk_file.read(frame_size)
-              if len(frame) != frame_size:
-                raise ValueError(f"Truncated parking frame {chunk}")
-              writer.write_frame((header if first_frame else b"") + frame,
-                                 timestamp_eof_ns * 90000 // 1_000_000_000)
-              frame_timestamps_ns.append(timestamp_eof_ns)
-              first_frame = False
-        if writer.frame_count == 0:
-          raise ValueError("Parking event contained no video frames")
+      frames: list[tuple[int, bytes]] = []
+      for chunk in sorted(event_dir.glob("*.h264")):
+        with chunk.open("rb") as chunk_file:
+          if chunk_file.read(len(CHUNK_MAGIC)) != CHUNK_MAGIC:
+            raise ValueError(f"Invalid parking chunk {chunk}")
+          header_size_data = chunk_file.read(4)
+          if len(header_size_data) != 4:
+            raise ValueError(f"Truncated parking chunk header {chunk}")
+          header = chunk_file.read(struct.unpack(">I", header_size_data)[0])
+          first_frame = True
+          while frame_metadata := chunk_file.read(12):
+            if len(frame_metadata) != 12:
+              raise ValueError(f"Truncated parking frame metadata {chunk}")
+            timestamp_eof_ns, frame_size = struct.unpack(">QI", frame_metadata)
+            frame = chunk_file.read(frame_size)
+            if len(frame) != frame_size:
+              raise ValueError(f"Truncated parking frame {chunk}")
+            frames.append((timestamp_eof_ns, (header if first_frame else b"") + frame))
+            first_frame = False
+      if not frames:
+        raise ValueError("Parking event contained no video frames")
 
-      duration = writer.frame_count / 20.0
-      start_wall_time_ns = output.stat().st_mtime_ns - int(duration * 1e9)
-      _write_route_qlog(output_dir / "qlog", self.params, start_wall_time_ns, frame_timestamps_ns)
-
+      duration = len(frames) / 20.0
+      start_wall_time_ns = time.time_ns() - int(duration * 1e9)
+      output_dirs = self._write_segmented_route(route, frames, start_wall_time_ns)
       self._mark_route_for_upload(route)
-      cloudlog.event("parking_recording_saved", route=route, path=str(output))
+      cloudlog.event("parking_recording_saved", route=route, segments=len(output_dirs))
     except Exception:
       cloudlog.exception("failed to save parking recording")
-      if output_created:
-        shutil.rmtree(output_dir, ignore_errors=True)
     finally:
-      lock.unlink(missing_ok=True)
       shutil.rmtree(event_dir, ignore_errors=True)
 
   def close(self) -> None:
