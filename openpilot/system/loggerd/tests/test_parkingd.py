@@ -35,7 +35,7 @@ def test_recorder_keeps_prebuffer_and_saves_post_motion(tmp_path):
 
   for second in range(131):
     keyframe = second % 5 == 0
-    recorder.add_packet(frame, header if keyframe else b"", keyframe, float(second))
+    recorder.add_packet(frame, header if keyframe else b"", keyframe, second * 1_000_000_000, float(second))
 
   recorder.trigger(130.0, "test")
   assert recorder.event_dir is not None
@@ -43,7 +43,7 @@ def test_recorder_keeps_prebuffer_and_saves_post_motion(tmp_path):
 
   for second in range(131, 192):
     keyframe = second % 5 == 0
-    recorder.add_packet(frame, header if keyframe else b"", keyframe, float(second))
+    recorder.add_packet(frame, header if keyframe else b"", keyframe, second * 1_000_000_000, float(second))
   recorder.close()
 
   outputs = list(tmp_path.glob("*--0/qcamera.ts"))

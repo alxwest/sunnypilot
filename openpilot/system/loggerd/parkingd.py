@@ -27,7 +27,7 @@ BUFFER_SECONDS = 120.0
 POST_MOTION_SECONDS = 60.0
 CHUNK_SECONDS = 5.0
 V4L2_BUF_FLAG_KEYFRAME = 0x8
-CHUNK_MAGIC = b"PKH1"
+CHUNK_MAGIC = b"PKH2"
 TS_PACKET_SIZE = 188
 TS_PAT_PID = 0x0000
 TS_PMT_PID = 0x0100
@@ -81,10 +81,54 @@ def _ts_duration_seconds(path: Path) -> float:
   return max(0.0, (last_pts - first_pts) / 90000.0 + 1.0 / 20.0)
 
 
-def _write_route_qlog(path: Path, params: Params, start_wall_time_ns: int, duration: float) -> None:
+def _read_ts_frames(path: Path):
+  pes = bytearray()
+  with path.open("rb") as stream:
+    while packet := stream.read(TS_PACKET_SIZE):
+      if len(packet) != TS_PACKET_SIZE or packet[0] != 0x47:
+        continue
+      pid = ((packet[1] & 0x1f) << 8) | packet[2]
+      if pid != TS_VIDEO_PID:
+        continue
+      adaptation_control = (packet[3] >> 4) & 0x03
+      if adaptation_control not in (1, 3):
+        continue
+      offset = 4
+      if adaptation_control == 3:
+        offset += 1 + packet[offset]
+      payload = packet[offset:]
+      if packet[1] & 0x40:
+        if pes:
+          header_size = 9 + pes[8]
+          yield bytes(pes[header_size:])
+        pes = bytearray(payload)
+      else:
+        pes.extend(payload)
+  if pes:
+    header_size = 9 + pes[8]
+    yield bytes(pes[header_size:])
+
+
+def _retime_parking_ts(source: Path, output: Path) -> list[int]:
+  frame_timestamps_ns: list[int] = []
+  start_timestamp_ns = time.monotonic_ns()
+  with output.open("wb") as output_file:
+    writer = MpegTsWriter(output_file)
+    for frame_id, frame in enumerate(_read_ts_frames(source)):
+      timestamp_ns = start_timestamp_ns + frame_id * 50_000_000
+      writer.write_frame(frame, timestamp_ns * 90000 // 1_000_000_000)
+      frame_timestamps_ns.append(timestamp_ns)
+  if not frame_timestamps_ns:
+    raise ValueError(f"No video frames in {source}")
+  return frame_timestamps_ns
+
+
+def _write_route_qlog(path: Path, params: Params, start_wall_time_ns: int,
+                      frame_timestamps_ns: list[int]) -> None:
   # Connect discovers routes and segment boundaries from qlogs. Match the
   # loggerd envelope and include qcamera frame indices for the whole segment.
-  start_mono_time_ns = time.monotonic_ns()
+  start_mono_time_ns = frame_timestamps_ns[0]
+  end_mono_time_ns = frame_timestamps_ns[-1] + 50_000_000
   init_msg = messaging.new_message("initData", valid=True)
   init_msg.logMonoTime = start_mono_time_ns
   init = init_msg.initData
@@ -109,12 +153,12 @@ def _write_route_qlog(path: Path, params: Params, start_wall_time_ns: int, durat
   started_msg.deviceState.startedMonoTime = start_mono_time_ns
 
   stopped_msg = messaging.new_message("deviceState", valid=True)
-  stopped_msg.logMonoTime = start_mono_time_ns + int(duration * 1e9)
+  stopped_msg.logMonoTime = end_mono_time_ns
   stopped_msg.deviceState.deviceType = HARDWARE.get_device_type()
   stopped_msg.deviceState.started = False
 
   end_msg = messaging.new_message("sentinel", valid=True)
-  end_msg.logMonoTime = start_mono_time_ns + int(duration * 1e9)
+  end_msg.logMonoTime = end_mono_time_ns
   end_msg.sentinel.type = "endOfRoute"
 
   gps_position = _last_gps_position(params)
@@ -123,8 +167,7 @@ def _write_route_qlog(path: Path, params: Params, start_wall_time_ns: int, durat
   with tmp.open("wb") as output:
     for msg in (init_msg, start_msg, started_msg):
       output.write(msg.to_bytes())
-    for frame_id in range(max(1, round(duration * 20))):
-      timestamp_ns = start_mono_time_ns + frame_id * 50_000_000
+    for frame_id, timestamp_ns in enumerate(frame_timestamps_ns):
       index_msg = messaging.new_message("qRoadEncodeIdx", valid=True)
       index_msg.logMonoTime = timestamp_ns
       index = index_msg.qRoadEncodeIdx
@@ -134,16 +177,16 @@ def _write_route_qlog(path: Path, params: Params, start_wall_time_ns: int, durat
       index.segmentNum = 0
       index.segmentId = frame_id
       index.segmentIdEncode = frame_id
-      index.timestampSof = timestamp_ns
-      index.timestampEof = timestamp_ns + 11_000_000
+      index.timestampSof = timestamp_ns - 11_000_000
+      index.timestampEof = timestamp_ns
       index.flags = 0x80004000 | (V4L2_BUF_FLAG_KEYFRAME if frame_id % 100 == 0 else 0)
       output.write(index_msg.to_bytes())
       if frame_id % 20 == 0:
         camera_msg = messaging.new_message("roadCameraState", valid=True)
-        camera_msg.logMonoTime = timestamp_ns + 12_000_000
+        camera_msg.logMonoTime = timestamp_ns + 1_000_000
         camera_msg.roadCameraState.frameId = frame_id
-        camera_msg.roadCameraState.timestampSof = timestamp_ns
-        camera_msg.roadCameraState.timestampEof = timestamp_ns + 11_000_000
+        camera_msg.roadCameraState.timestampSof = timestamp_ns - 11_000_000
+        camera_msg.roadCameraState.timestampEof = timestamp_ns
         output.write(camera_msg.to_bytes())
 
         if gps_position is not None:
@@ -251,11 +294,11 @@ class MpegTsWriter:
     self._write_payload(TS_PAT_PID, b"\x00" + pat)
     self._write_payload(TS_PMT_PID, b"\x00" + pmt)
 
-  def write_frame(self, data: bytes) -> None:
+  def write_frame(self, data: bytes, pts: int | None = None) -> None:
     if self.frame_count % 20 == 0:
       self._write_program_tables()
 
-    pts = self.frame_count * self.frame_duration
+    pts = self.frame_count * self.frame_duration if pts is None else pts
     pes = b"\x00\x00\x01\xe0\x00\x00\x80\x80\x05" + _encode_pts(pts) + data
     random_access = b"\x00\x00\x00\x01\x65" in data or b"\x00\x00\x01\x65" in data
     self._write_payload(TS_VIDEO_PID, pes, pcr=pts, random_access=random_access)
@@ -321,7 +364,7 @@ class ParkingRecorder:
       if not source.is_file():
         continue
       try:
-        if os.getxattr(source, "user.parking_migrated").startswith(b"v2:"):
+        if os.getxattr(source, "user.parking_migrated").startswith(b"v3:"):
           continue
       except OSError:
         pass
@@ -333,11 +376,11 @@ class ParkingRecorder:
       try:
         output_dir.mkdir()
         lock.touch()
-        shutil.copyfile(source, output)
-        duration = _ts_duration_seconds(output)
+        frame_timestamps_ns = _retime_parking_ts(source, output)
+        duration = len(frame_timestamps_ns) / 20.0
         start_wall_time_ns = source.stat().st_mtime_ns - int(duration * 1e9)
-        _write_route_qlog(output_dir / "qlog", self.params, start_wall_time_ns, duration)
-        os.setxattr(source, "user.parking_migrated", b"v2:" + route.encode())
+        _write_route_qlog(output_dir / "qlog", self.params, start_wall_time_ns, frame_timestamps_ns)
+        os.setxattr(source, "user.parking_migrated", b"v3:" + route.encode())
         self._mark_route_for_upload(route)
         cloudlog.event("parking_route_migrated", source=str(legacy_dir), route=route)
       except Exception:
@@ -357,7 +400,9 @@ class ParkingRecorder:
         lock.touch()
         duration = _ts_duration_seconds(output)
         start_wall_time_ns = output.stat().st_mtime_ns - int(duration * 1e9)
-        _write_route_qlog(qlog, self.params, start_wall_time_ns, duration)
+        start_timestamp_ns = time.monotonic_ns()
+        frame_timestamps_ns = [start_timestamp_ns + i * 50_000_000 for i in range(max(1, round(duration * 20)))]
+        _write_route_qlog(qlog, self.params, start_wall_time_ns, frame_timestamps_ns)
         cloudlog.event("parking_qlog_backfilled", path=str(qlog))
       except Exception:
         cloudlog.exception("failed to backfill parking qlog")
@@ -420,7 +465,7 @@ class ParkingRecorder:
         self._link_event_chunk(chunk.path)
     cloudlog.event("parking_motion_detected", reason=reason, route=self.event_route)
 
-  def add_packet(self, data: bytes, header: bytes, keyframe: bool, now: float) -> None:
+  def add_packet(self, data: bytes, header: bytes, keyframe: bool, timestamp_eof_ns: int, now: float) -> None:
     if header:
       self.latest_header = header
     if self.current is None:
@@ -432,7 +477,7 @@ class ParkingRecorder:
       self._start_chunk(now, self.latest_header)
 
     assert self.current_file is not None
-    self.current_file.write(struct.pack(">I", len(data)))
+    self.current_file.write(struct.pack(">QI", timestamp_eof_ns, len(data)))
     self.current_file.write(data)
     self._trim_buffer(now)
 
@@ -463,6 +508,7 @@ class ParkingRecorder:
       lock.touch()
       with output.open("wb") as output_file:
         writer = MpegTsWriter(output_file)
+        frame_timestamps_ns: list[int] = []
         for chunk in sorted(event_dir.glob("*.h264")):
           with chunk.open("rb") as chunk_file:
             if chunk_file.read(len(CHUNK_MAGIC)) != CHUNK_MAGIC:
@@ -472,21 +518,23 @@ class ParkingRecorder:
               raise ValueError(f"Truncated parking chunk header {chunk}")
             header = chunk_file.read(struct.unpack(">I", header_size_data)[0])
             first_frame = True
-            while frame_size_data := chunk_file.read(4):
-              if len(frame_size_data) != 4:
-                raise ValueError(f"Truncated parking frame size {chunk}")
-              frame_size = struct.unpack(">I", frame_size_data)[0]
+            while frame_metadata := chunk_file.read(12):
+              if len(frame_metadata) != 12:
+                raise ValueError(f"Truncated parking frame metadata {chunk}")
+              timestamp_eof_ns, frame_size = struct.unpack(">QI", frame_metadata)
               frame = chunk_file.read(frame_size)
               if len(frame) != frame_size:
                 raise ValueError(f"Truncated parking frame {chunk}")
-              writer.write_frame((header if first_frame else b"") + frame)
+              writer.write_frame((header if first_frame else b"") + frame,
+                                 timestamp_eof_ns * 90000 // 1_000_000_000)
+              frame_timestamps_ns.append(timestamp_eof_ns)
               first_frame = False
         if writer.frame_count == 0:
           raise ValueError("Parking event contained no video frames")
 
       duration = writer.frame_count / 20.0
       start_wall_time_ns = output.stat().st_mtime_ns - int(duration * 1e9)
-      _write_route_qlog(output_dir / "qlog", self.params, start_wall_time_ns, duration)
+      _write_route_qlog(output_dir / "qlog", self.params, start_wall_time_ns, frame_timestamps_ns)
 
       self._mark_route_for_upload(route)
       cloudlog.event("parking_recording_saved", route=route, path=str(output))
@@ -528,7 +576,7 @@ def main() -> None:
       packet = sm[video_service]
       keyframe = bool(packet.idx.flags & V4L2_BUF_FLAG_KEYFRAME)
       data = bytes(packet.data)
-      recorder.add_packet(data, bytes(packet.header), keyframe, now)
+      recorder.add_packet(data, bytes(packet.header), keyframe, int(packet.idx.timestampEof), now)
   finally:
     recorder.close()
 
