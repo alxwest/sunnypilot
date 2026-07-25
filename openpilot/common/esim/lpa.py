@@ -634,7 +634,7 @@ def _cancel_session_safe(client: AtClient, smdp: str, tx_id: str, session: reque
     pass
 
 
-def download_profile(client: AtClient, activation_code: str) -> str:
+def download_profile(client: AtClient, activation_code: str, confirmation_code: str | None = None) -> str:
   """Download and install an eSIM profile. Returns the ICCID of the installed profile."""
   if not system_time_valid():
     raise RuntimeError("System time is not set; TLS certificate validation requires a valid clock")
@@ -666,7 +666,7 @@ def download_profile(client: AtClient, activation_code: str) -> str:
     # step 4: prepare download
     b64_prep = prepare_download(client,
       _b64_field(cli, "smdpSigned2"), _b64_field(cli, "smdpSignature2"),
-      _b64_field(cli, "smdpCertificate"))
+      _b64_field(cli, "smdpCertificate"), confirmation_code)
 
     # step 5: get and install bound profile package
     bpp = es9p_request(smdp, "getBoundProfilePackage", {
@@ -747,9 +747,9 @@ class TiciLPA(LPABase):
     if code != PROFILE_OK:
       raise LPAError(f"DeleteProfile failed: {PROFILE_ERROR_CODES.get(code, 'unknown')} (0x{code:02X})")
 
-  def download_profile(self, qr: str, nickname: str | None = None) -> None:
+  def download_profile(self, qr: str, nickname: str | None = None, confirmation_code: str | None = None) -> None:
     with self._acquire_channel():
-      iccid = download_profile(self._client, qr)
+      iccid = download_profile(self._client, qr, confirmation_code)
       if nickname and iccid:
         set_profile_nickname(self._client, iccid, nickname)
 

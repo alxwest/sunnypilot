@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import getpass
 from openpilot.common.hardware import HARDWARE
 from openpilot.common.esim.base import LPABase, Profile
 
@@ -40,8 +41,9 @@ if __name__ == '__main__':
   p_delete.add_argument('profile', help='iccid or 1-based index from `list`')
 
   p_download = sub.add_parser('download', help='download a profile using QR code (format: LPA:1$rsp.truphone.com$QRF-SPEEDTEST)')
-  p_download.add_argument('qr')
+  p_download.add_argument('qr', help="QR activation code, or '-' to enter it without echo")
   p_download.add_argument('name')
+  p_download.add_argument('--confirmation-code', action='store_true', help='prompt for a confirmation code without echo')
 
   p_nickname = sub.add_parser('nickname', help='update the nickname for a profile')
   p_nickname.add_argument('profile', help='iccid or 1-based index from `list`')
@@ -61,7 +63,9 @@ if __name__ == '__main__':
       print('cancelled')
       exit(0)
   elif args.cmd == 'download':
-    lpa.download_profile(args.qr, args.name)
+    qr = getpass.getpass('Activation code: ') if args.qr == '-' else args.qr
+    confirmation_code = getpass.getpass('Confirmation code: ') if args.confirmation_code else None
+    lpa.download_profile(qr, args.name, confirmation_code)
   elif args.cmd == 'nickname':
     lpa.nickname_profile(resolve_iccid(lpa, args.profile), args.name)
   else:
