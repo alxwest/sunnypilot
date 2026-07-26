@@ -27,6 +27,11 @@ sections:
   - key: QuietMode
     widget: toggle
     title: Quiet Mode
+  - key: ParkingMotionRecording
+    widget: toggle
+    title: Parking Motion Recording
+    description: Keep a two-minute low-bandwidth road-camera buffer while parked. When physical device motion is detected,
+      save the buffer plus one additional minute and upload it when connected. This increases offroad power use.
   - key: MuteReverseAlert
     widget: toggle
     title: Mute Reverse Alert

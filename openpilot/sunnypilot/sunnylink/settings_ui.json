@@ -1297,12 +1297,6 @@
               "description": "When enabled, visual turn indicators are drawn on the HUD."
             },
             {
-              "key": "ParkingMotionRecording",
-              "widget": "toggle",
-              "title": "Parking Motion Recording",
-              "description": "Keep a two-minute low-bandwidth road-camera buffer while parked. When camera or device motion is detected, save the buffer plus one additional minute and upload it when connected. This increases offroad power use."
-            },
-            {
               "key": "RadarTracks",
               "widget": "toggle",
               "title": "Radar Tracks",
@@ -1588,6 +1582,12 @@
               "key": "QuietMode",
               "widget": "toggle",
               "title": "Quiet Mode"
+            },
+            {
+              "key": "ParkingMotionRecording",
+              "widget": "toggle",
+              "title": "Parking Motion Recording",
+              "description": "Keep a two-minute low-bandwidth road-camera buffer while parked. When physical device motion is detected, save the buffer plus one additional minute and upload it when connected. This increases offroad power use."
             },
             {
               "key": "MuteReverseAlert",
