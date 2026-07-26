@@ -34,7 +34,8 @@ from openpilot.sunnypilot.sunnylink.api import SunnylinkApi
 from openpilot.sunnypilot.sunnylink.utils import sunnylink_need_register, sunnylink_ready, get_param_as_byte, save_param_from_base64_encoded_string
 from openpilot.sunnypilot.sunnylink.capabilities import generate_capabilities, CAPABILITY_LABELS
 from openpilot.sunnypilot.sunnylink.tools.generate_settings_schema import generate_schema
-from openpilot.system.loggerd.parking_settings import PARKING_ENABLED_PARAM, get_bool as get_parking_setting, put_bool as put_parking_setting
+from openpilot.system.loggerd.parking_settings import PARKING_ENABLED_PARAM, get_bool as get_parking_setting, \
+  parse_bool as parse_parking_bool, put_bool as put_parking_setting
 
 SUNNYLINK_ATHENA_HOST = os.getenv('SUNNYLINK_ATHENA_HOST', 'wss://athena.sunnylink.ai')
 HANDLER_THREADS = int(os.getenv('HANDLER_THREADS', "4"))
@@ -255,9 +256,7 @@ def saveParams(params_to_update: dict[str, str], compression: bool = False) -> N
         raw_value = base64.b64decode(value)
         if compression:
           raw_value = gzip.decompress(raw_value)
-        if raw_value not in (b"0", b"1"):
-          raise ValueError(f"Invalid boolean value for {key}")
-        put_parking_setting(params, key, raw_value == b"1")
+        put_parking_setting(params, key, parse_parking_bool(raw_value))
         continue
       save_param_from_base64_encoded_string(key, value, compression)
     except Exception as e:

@@ -15,6 +15,15 @@ CUSTOM_PARAM_TYPES = {
 }
 
 
+def parse_bool(value: bytes) -> bool:
+  normalized = value.strip().lower()
+  if normalized in (b"1", b"true"):
+    return True
+  if normalized in (b"0", b"false"):
+    return False
+  raise ValueError(f"Invalid boolean value: {value!r}")
+
+
 def _is_registered(params: Params, key: str) -> bool:
   try:
     params.check_key(key)
