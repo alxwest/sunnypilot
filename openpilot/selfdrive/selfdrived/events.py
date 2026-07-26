@@ -7,6 +7,7 @@ from opendbc.car.structs import car
 import openpilot.cereal.messaging as messaging
 from openpilot.common.constants import CV
 from openpilot.common.git import get_short_branch
+from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.locationd.calibrationd import MIN_SPEED_FILTER
 from openpilot.system.micd import SAMPLE_RATE, SAMPLE_BUFFER
@@ -68,6 +69,16 @@ def user_soft_disable_alert(alert_text_2: str) -> AlertCallbackType:
       return ImmediateDisableAlert(alert_text_2)
     return UserSoftDisableAlert(alert_text_2)
   return func
+
+
+def reverse_gear_disable_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster,
+                               metric: bool, soft_disable_time: int, personality) -> Alert:
+  text = "Reverse" if HARDWARE.get_device_type() == "mici" else "Reverse Gear"
+  alert = ImmediateDisableAlert(text)
+  if Params().get_bool("MuteReverseAlert"):
+    alert.audible_alert = AudibleAlert.none
+  return alert
+
 
 def startup_master_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
   branch = get_short_branch()  # Ensure get_short_branch is cached to avoid lags on startup
@@ -806,7 +817,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
       "",
       AlertStatus.normal, AlertSize.full,
       Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .2, creation_delay=0.5),
-    ET.USER_DISABLE: ImmediateDisableAlert("Reverse Gear"),
+    ET.USER_DISABLE: reverse_gear_disable_alert,
     ET.NO_ENTRY: NoEntryAlert("Reverse Gear"),
   },
 
@@ -926,7 +937,7 @@ if HARDWARE.get_device_type() == 'mici':
         "",
         AlertStatus.normal, AlertSize.full,
         Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .2, creation_delay=0.5),
-      ET.USER_DISABLE: ImmediateDisableAlert("Reverse"),
+      ET.USER_DISABLE: reverse_gear_disable_alert,
       ET.NO_ENTRY: NoEntryAlert("Reverse"),
     },
   })

@@ -1590,6 +1590,12 @@
               "title": "Quiet Mode"
             },
             {
+              "key": "MuteReverseAlert",
+              "widget": "toggle",
+              "title": "Mute Reverse Alert",
+              "description": "Mute the comma alert sound when reverse is selected. Reverse still disengages driving assistance and shows its visual warning."
+            },
+            {
               "key": "OnroadUploads",
               "widget": "toggle",
               "title": "Onroad Uploads"
